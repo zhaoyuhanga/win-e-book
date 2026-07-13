@@ -1241,6 +1241,16 @@ class EditorPanel(QFrame):
         new_text = self._ia_result.toPlainText().strip()
         if not new_text or not self._ia_original:
             return
+        # Phase 4a:先弹 Diff 对话框让用户确认(红绿对比)
+        if new_text != self._ia_original:
+            from src.ui.diff_dialog import DiffDialog
+            dlg = DiffDialog(
+                self._ia_original, new_text,
+                title="AI 修改预览",
+                parent=self,
+            )
+            if dlg.exec() != DiffDialog.Accepted:
+                return  # 用户拒绝
         cursor = self.editor.textCursor()
         if cursor.hasSelection():
             cursor.insertText(new_text)
