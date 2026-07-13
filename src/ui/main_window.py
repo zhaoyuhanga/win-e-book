@@ -1,17 +1,20 @@
-"""主窗口:用 QStackedWidget 实现两页切换。
+"""主窗口:用 QStackedWidget 实现多页切换。
 
-Page 0 = 主页(书库网格,墨读风格)
-Page 1 = 阅读详情页(ReaderView)
+Page 0 = 首页(墨软,墨读/墨写入口)
+Page 1 = 书库(LibraryList)
+Page 2 = 阅读详情页(ReaderView)
+Page 3 = 在线书库(OnlineView)
+Page 4 = 墨写(WriteView)
 """
 from __future__ import annotations
 
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QKeySequence, QShortcut, QFont
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QFont, QIcon
 from PySide6.QtWidgets import (
-    QMainWindow, QStatusBar, QMessageBox, QLabel, QWidget,
+    QMainWindow, QStatusBar, QMessageBox, QLabel, QWidget, QToolButton,
     QVBoxLayout, QHBoxLayout, QLineEdit, QFrame, QStackedWidget,
 )
 
@@ -19,7 +22,9 @@ from src.core import Library, BookRecord, Book
 from src.ui.library_view import LibraryList
 from src.ui.reader_view import ReaderView
 from src.ui.online_view import OnlineView
-from src.ui.theme import THEME_QSS, FONT_HEADING
+from src.ui.home_view import HomeView
+from src.ui.write_view import WriteView
+from src.ui.theme import THEME_QSS, FONT_HEADING, ACCENT, TEXT_SECONDARY, SURFACE, BORDER
 
 
 # ============================================================
@@ -28,6 +33,8 @@ from src.ui.theme import THEME_QSS, FONT_HEADING
 
 class TopBar(QFrame):
     """顶部品牌条(56px)。"""
+
+    home_clicked = Signal()  # 用户点了"墨软 / 返回首页"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,10 +45,11 @@ class TopBar(QFrame):
         layout.setContentsMargins(20, 0, 20, 0)
         layout.setSpacing(14)
 
-        # logo
+        # logo(可点击,作"返回首页"按钮)
         self.logo = QLabel("墨")
         self.logo.setAlignment(Qt.AlignCenter)
         self.logo.setFixedSize(36, 36)
+        self.logo.setCursor(Qt.PointingHandCursor)
         self.logo.setStyleSheet(
             "QLabel {"
             " background: qlineargradient(x1:0, y1:0, x2:1, y2:1,"
@@ -53,13 +61,14 @@ class TopBar(QFrame):
         )
         layout.addWidget(self.logo)
 
-        # 品牌名
-        self.brand_name = QLabel("墨读")
+        # 品牌名(也可点回首页)
+        self.brand_name = QLabel("墨软")
         self.brand_name.setProperty("role", "brand-name")
+        self.brand_name.setCursor(Qt.PointingHandCursor)
         layout.addWidget(self.brand_name)
 
         # tagline
-        tagline = QLabel("·  经典阅读")
+        tagline = QLabel("·  经典阅读  ·  智能写作")
         tagline.setStyleSheet(
             "QLabel { color: #6b7384; font-size: 12px; background: transparent; }"
         )
@@ -74,12 +83,35 @@ class TopBar(QFrame):
 
         layout.addStretch(1)
 
+        # 返回首页按钮(只在非首页时显示)
+        self.btn_home = QToolButton()
+        self.btn_home.setText("⌂  墨软")
+        self.btn_home.setToolTip("返回首页(墨读 / 墨写 入口)")
+        self.btn_home.setCursor(Qt.PointingHandCursor)
+        self.btn_home.setStyleSheet(
+            "QToolButton {"
+            f"  background: transparent; color: {TEXT_SECONDARY};"
+            f"  border: 1px solid {BORDER}; border-radius: 5px;"
+            "  padding: 4px 10px; font-size: 12px;"
+            "}"
+            f"QToolButton:hover {{ color: {ACCENT}; border: 1px solid {ACCENT}; }}"
+        )
+        self.btn_home.clicked.connect(self.home_clicked)
+        self.btn_home.hide()  # 默认隐藏
+        layout.addWidget(self.btn_home)
+
         # 右侧
-        self.subtitle = QLabel("本地版 · v1.0")
+        self.subtitle = QLabel("v1.0 · dev-v1")
         self.subtitle.setStyleSheet(
             "QLabel { color: #6b7384; font-size: 11px; background: transparent; }"
         )
         layout.addWidget(self.subtitle)
+
+    def mousePressEvent(self, ev):
+        # 点 logo / 品牌名 → 返回首页
+        if ev.button() == Qt.LeftButton and self.underMouse():
+            self.home_clicked.emit()
+        super().mousePressEvent(ev)
 
 
 # ============================================================
@@ -87,15 +119,17 @@ class TopBar(QFrame):
 # ============================================================
 
 class MainWindow(QMainWindow):
-    PAGE_LIBRARY = 0
-    PAGE_READER  = 1
-    PAGE_ONLINE  = 2
+    PAGE_HOME    = 0  # 墨软首页
+    PAGE_LIBRARY = 1  # 墨读书库
+    PAGE_READER  = 2  # 阅读详情页
+    PAGE_ONLINE  = 3  # 在线书库
+    PAGE_WRITE   = 4  # 墨写
 
     def __init__(self, library: Library):
         super().__init__()
         self.library = library
-        self.setWindowTitle("墨读 · WinEBook  本地电子书阅读器")
-        self.resize(1320, 860)
+        self.setWindowTitle("墨软 · 墨读 + 墨写")
+        self.resize(1280, 820)
         self.setStyleSheet(THEME_QSS)
 
         # 中央(顶栏 + QStackedWidget)
@@ -104,15 +138,21 @@ class MainWindow(QMainWindow):
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.setSpacing(0)
 
-        # 顶栏(三页共用)
+        # 顶栏(多页共用)
         self.topbar = TopBar()
+        self.topbar.home_clicked.connect(self._go_home)
+        # 让 logo / 品牌名 也可点击回首页
+        for w in (self.topbar.logo, self.topbar.brand_name):
+            w.mousePressEvent = self._logo_clicked
         central_layout.addWidget(self.topbar)
 
         # Stacked pages
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_library_page())
-        self.stack.addWidget(self._build_reader_page())
-        self.stack.addWidget(self._build_online_page())
+        self.stack.addWidget(self._build_home_page())    # 0
+        self.stack.addWidget(self._build_library_page()) # 1
+        self.stack.addWidget(self._build_reader_page())  # 2
+        self.stack.addWidget(self._build_online_page())  # 3
+        self.stack.addWidget(self._build_write_page())   # 4
         central_layout.addWidget(self.stack, 1)
 
         self.setCentralWidget(central)
@@ -130,10 +170,26 @@ class MainWindow(QMainWindow):
         # 快捷键
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self._import_via_shortcut)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._go_online)
+        QShortcut(QKeySequence("Ctrl+Alt+L"), self, activated=self._go_online)
+        QShortcut(QKeySequence("Ctrl+Alt+W"), self, activated=self._go_write)
+        QShortcut(QKeySequence("Ctrl+Alt+H"), self, activated=self._go_home)
+        QShortcut(QKeySequence("Ctrl+Alt+R"), self, activated=self._go_library)
 
-        # 默认在主页
-        self.stack.setCurrentIndex(self.PAGE_LIBRARY)
-        self._auto_open_last_or_library()
+        # 默认在首页
+        self.stack.setCurrentIndex(self.PAGE_HOME)
+        self._update_topbar_for_page()
+
+    def _build_home_page(self) -> QWidget:
+        """墨软首页。"""
+        self.home_view = HomeView()
+        self.home_view.enter_read.connect(self._go_library)
+        self.home_view.enter_write.connect(self._go_write)
+        return self.home_view
+
+    def _build_write_page(self) -> QWidget:
+        """墨写页(三栏:文件树/编辑器/AI 助手)。"""
+        self.write_view = WriteView()
+        return self.write_view
 
     def _build_library_page(self) -> QWidget:
         """主页:书库网格。"""
@@ -182,6 +238,7 @@ class MainWindow(QMainWindow):
         # 切回主页 + 刷新
         self.stack.setCurrentIndex(self.PAGE_LIBRARY)
         self.library_view.refresh()
+        self._update_topbar_for_page()
         QMessageBox.information(self, "✓ 导入成功",
                                f"已加入书库:\n{os.path.basename(file_path)}")
 
@@ -217,10 +274,21 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_quit)
 
         view_menu = m.addMenu("视图(&V)")
-        act_home = QAction("本地书库(&L)", self)
-        act_home.setShortcut("Ctrl+L")
-        act_home.triggered.connect(self._back_to_library)
-        view_menu.addAction(act_home)
+
+        act_soft = QAction("墨软首页(&M)  Ctrl+Alt+H", self)
+        act_soft.setShortcut("Ctrl+Alt+H")
+        act_soft.triggered.connect(self._go_home)
+        view_menu.addAction(act_soft)
+
+        act_lib = QAction("墨读·本地书库(&L)  Ctrl+Alt+R", self)
+        act_lib.setShortcut("Ctrl+Alt+R")
+        act_lib.triggered.connect(self._go_library)
+        view_menu.addAction(act_lib)
+
+        act_write = QAction("墨写·写作助手(&W)  Ctrl+Alt+W", self)
+        act_write.setShortcut("Ctrl+Alt+W")
+        act_write.triggered.connect(self._go_write)
+        view_menu.addAction(act_write)
 
         act_online = QAction("在线书库(&O)  Ctrl+Alt+L", self)
         act_online.setShortcut("Ctrl+Alt+L")
@@ -237,26 +305,49 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(self.PAGE_LIBRARY)
         self.library_view._on_import_clicked()
 
+    def _go_home(self):
+        """切到墨软首页。"""
+        self.stack.setCurrentIndex(self.PAGE_HOME)
+        self.status_label.setText("墨软  ·  选择模块:墨读 / 墨写")
+        self._update_topbar_for_page()
+
+    def _logo_clicked(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self._go_home()
+
+    def _go_library(self):
+        """切到墨读书库。"""
+        self.stack.setCurrentIndex(self.PAGE_LIBRARY)
+        self.status_label.setText("墨读  ·  本地书库")
+        self._update_topbar_for_page()
+
+    def _go_write(self):
+        """切到墨写。"""
+        self.stack.setCurrentIndex(self.PAGE_WRITE)
+        self.status_label.setText("墨写  ·  LLM 写作助手")
+        self._update_topbar_for_page()
+
     def _go_online(self):
         """切到在线书库页。"""
-        # 调整搜索框:主页用;其他页隐藏或禁用
         self.stack.setCurrentIndex(self.PAGE_ONLINE)
         self.status_label.setText("在线书库(联网请选择来源 + 搜索关键字)")
+        self._update_topbar_for_page()
+
+    def _update_topbar_for_page(self):
+        """根据当前页更新顶栏:在首页时隐藏"返回首页"按钮,其他页显示。"""
+        if self.stack.currentIndex() == self.PAGE_HOME:
+            self.topbar.btn_home.hide()
+        else:
+            self.topbar.btn_home.show()
 
     def _auto_open_last_or_library(self):
+        """(保留兼容)原本用于自动开上次读的书,新版默认停在首页不自动开。"""
         recs = self.library.list_books()
         if not recs:
-            self.status_label.setText("点击「导入文件」或「批量导入」开始使用  ·  Ctrl+Alt+L 联网搜书")
-            self.stack.setCurrentIndex(self.PAGE_LIBRARY)
+            self.status_label.setText("欢迎使用墨软  ·  点击「墨读」或「墨写」卡片开始  ·  Ctrl+Alt+L 联网搜书")
             return
-        target = None
-        for r in recs:
-            if r.last_opened_at and (target is None or r.last_opened_at > (target.last_opened_at or 0)):
-                target = r
-        if target is None:
-            target = recs[0]
-        self.library_view.select_book_id(target.id)
-        self._on_book_selected(target.id)
+        n_books = len(recs)
+        self.status_label.setText(f"墨软  ·  书库共 {n_books} 本书  ·  点击卡片开始")
 
     def _on_book_selected(self, book_id: int):
         try:
@@ -286,6 +377,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("就绪")
         self.stack.setCurrentIndex(self.PAGE_LIBRARY)
         self.library_view.refresh()
+        self._update_topbar_for_page()
 
     def _refresh_reader_history(self):
         if self.reader_view._record is not None:
@@ -304,6 +396,12 @@ class MainWindow(QMainWindow):
     def closeEvent(self, ev):
         try:
             self.reader_view._flush_position()
+        except Exception:
+            pass
+        try:
+            # 关闭墨写后台 LLM 线程
+            if hasattr(self, "write_view"):
+                self.write_view.shutdown()
         except Exception:
             pass
         try:

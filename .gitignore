@@ -28,6 +28,7 @@ data/
 htmlcov/
 *.tmp
 .tmp_*
+.tmp_qs/
 *.log
 
 # ---------- IDE ----------
