@@ -1,0 +1,45 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 打包产物 ----------
+# 注意:dist/ 故意保留,exe 一起推到仓库里方便用户直接用
+build/
+*.spec.bak
+
+# ---------- 个人数据(不进入版本控制)----------
+a-book/
+e-book/
+data/
+
+# ---------- 测试 / 临时 ----------
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+*.tmp
+.tmp_*
+*.log
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------- 工具产物 ----------
+*.egg-info/
+.tox/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,5 @@
+PySide6>=6.6.0
+ebooklib>=0.18
+lxml>=4.9.0
+beautifulsoup4>=4.12.0
+chardet>=5.2.0
