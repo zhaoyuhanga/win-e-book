@@ -217,3 +217,25 @@ def build_agent_system(preset: WriteAgentPreset) -> str:
         f"始终使用中文回答,除非用户明确要求其他语言。"
         f"在合理范围内提供详尽、有结构的输出。"
     )
+
+
+# ============================================================
+# 工作区根(给 BM25 用)
+# ============================================================
+
+import os
+from pathlib import Path as _Path
+
+
+def default_workspace_root() -> _Path:
+    """墨写 workspace 默认放 ~/Documents/墨写。"""
+    docs = _Path(os.path.expanduser("~/Documents"))
+    p = docs / "墨写"
+    if not p.exists():
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # 兜底
+            p = _Path(os.path.expanduser("~")) / "墨写"
+            p.mkdir(parents=True, exist_ok=True)
+    return p

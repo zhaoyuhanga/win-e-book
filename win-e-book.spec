@@ -28,6 +28,7 @@ a = Analysis(
         'src.core.online',
         'src.core.llm',
         'src.core.write_agent',
+        'src.core.bm25',
         'src.ui',
         'src.ui.main_window',
         'src.ui.library_view',

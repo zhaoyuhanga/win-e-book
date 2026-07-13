@@ -390,7 +390,7 @@ class EditorPanel(QFrame):
         self._highlighter = MarkdownHighlighter(self.editor.document())
         self._highlighter.setDocument(self.editor.document())
 
-        # 在线补全(短):浮动 ghost 文本
+        # 在线补全(短 + 长):浮动 ghost 文本
         self._ghost_label = QLabel(self.editor)
         self._ghost_label.setStyleSheet(
             "QLabel {"
@@ -404,19 +404,23 @@ class EditorPanel(QFrame):
         self._ghost_label.hide()
         self._ghost_text: str = ""
         self._ghost_anchor: int = 0  # ghost 锚点位置
-        self._completion_timer = QTimer(self)
-        self._completion_timer.setSingleShot(True)
-        self._completion_timer.timeout.connect(self._trigger_completion)
+        # 短补全 timer
+        self._short_timer = QTimer(self)
+        self._short_timer.setSingleShot(True)
+        self._short_timer.timeout.connect(lambda: self._trigger_completion("short"))
+        # 长补全 timer(段落级)
+        self._long_timer = QTimer(self)
+        self._long_timer.setSingleShot(True)
+        self._long_timer.timeout.connect(lambda: self._trigger_completion("long"))
         self._completion_thread: Optional[QThread] = None
         self._completion_worker: Optional[_LLMWorker] = None
-        self._completion_ctx_cache: Tuple[int, int] = (0, 0)  # (pos, sel_len) 去重
+        self._completion_mode: str = ""  # "short" / "long"
         # 默认 debounce
         from PySide6.QtCore import QSettings
         cs = QSettings("WinEBook", "InlineCompletion")
         self._completion_enabled: bool = cs.value("enabled", True, type=bool)
-        self._completion_debounce_ms: int = cs.value("debounce_ms", 800, type=int)
-        if not self._completion_enabled:
-            self._completion_timer.stop()
+        self._short_debounce_ms: int = cs.value("short_debounce_ms", 800, type=int)
+        self._long_debounce_ms: int = cs.value("long_debounce_ms", 2500, type=int)
 
         # ---------- 底部状态栏 ----------
         statusbar = QFrame()
@@ -492,12 +496,24 @@ class EditorPanel(QFrame):
         self._update_word_count()
         if self._live_mode and self._file_path and self.live_toggle.isChecked():
             self._save_label_delayed()
-        # 触发在线补全(短)
+        # 触发在线补全(短 + 长)
         if self._completion_enabled and self.live_toggle.isChecked():
-            # 已经有 ghost 的话,先清掉
             self._hide_ghost()
-            # 重新计时
-            self._completion_timer.start(self._completion_debounce_ms)
+            # 取消两个 timer
+            self._short_timer.stop()
+            self._long_timer.stop()
+            # 检测是否在段落结尾(决定启动短还是长)
+            cursor = self.editor.textCursor()
+            pos = cursor.position()
+            full = self.editor.toPlainText()
+            prefix = full[max(0, pos - 100):pos]
+            at_para_end = bool(prefix) and prefix[-1] in "。！？.!?\n…"
+            if at_para_end and len(prefix.rstrip()) >= 5:
+                # 段落结尾 + 一定长度 → 长补全
+                self._long_timer.start(self._long_debounce_ms)
+            else:
+                # 普通停顿时短补全
+                self._short_timer.start(self._short_debounce_ms)
 
     def _save_label_delayed(self):
         self.save_label.setText("保存中…")
@@ -535,53 +551,80 @@ class EditorPanel(QFrame):
         else:
             self._highlighter.setDocument(None)
             self._hide_ghost()
-            self._completion_timer.stop()
+            self._short_timer.stop()
+            self._long_timer.stop()
         self._highlighter.rehighlight()
 
-    # ---------- 在线补全(短) ----------
-    def _trigger_completion(self):
-        """防抖到期:取上下文,调 LLM 拿补全。"""
+    # ---------- 在线补全(短 + 长) ----------
+    def _trigger_completion(self, mode: str = "short"):
+        """防抖到期:取上下文,调 LLM 拿补全。
+
+        mode:
+        - short:短补全,8-80 字,800ms 防抖
+        - long: 长补全,段落级,200-800 字,2500ms 防抖
+        """
         from src.core.llm import LLMClient, load_config
         cfg = load_config()
         if not cfg.is_valid():
             return
-        # 取光标位置
         cursor = self.editor.textCursor()
         pos = cursor.position()
         full = self.editor.toPlainText()
-        # 抽前 1500 + 后 500
-        prefix = full[max(0, pos - 1500):pos]
-        suffix = full[pos:pos + 500]
-        # 跳过空白/换行:不补全
+        # 长补全:抽更多上下文
+        if mode == "long":
+            pre_n, suf_n = 2500, 200
+            max_tok = 1024
+            sys_prompt = (
+                "你是一位中文写作助手,任务是根据上下文续写下一段。"
+                "输出**整段内容**,保持原文的文风、节奏、人称。"
+                "不要重复前缀或后缀,不要解释,不要带引号。"
+                "长度 200-800 字。"
+            )
+        else:
+            pre_n, suf_n = 1500, 500
+            max_tok = 128
+            sys_prompt = (
+                "你是一位中文写作助手,任务是根据上下文续写下一句或下一段。"
+                "只输出续写的内容,不要重复前缀或后缀,不要解释,不要带引号。"
+                "长度控制在 8-80 字以内。"
+            )
+        prefix = full[max(0, pos - pre_n):pos]
+        suffix = full[pos:pos + suf_n]
         if not prefix.strip():
             return
-        # 跳过用户在选区中
         if cursor.hasSelection():
             return
-        # 避免重复请求(同样的 pos + 文本)
-        cache_key = (pos, hash(prefix[-100:]))
+        cache_key = (mode, pos, hash(prefix[-100:]))
         if cache_key == getattr(self, "_last_completion_key", None):
             return
         self._last_completion_key = cache_key
 
-        system = (
-            "你是一位中文写作助手,任务是根据上下文续写下一句或下一段。"
-            "只输出续写的内容,不要重复前缀或后缀,不要解释,不要带引号。"
-            "长度控制在 8-80 字以内。"
-        )
+        # BM25 检索(用工作区)
+        from src.core.bm25 import search_workspace, format_hits_for_prompt
+        from src.core.write_agent import default_workspace_root
+        ctx_text = ""
+        try:
+            ws_root = default_workspace_root()
+            hits = search_workspace(ws_root, prefix[-300:], k=2, snippet_chars=400)
+            ctx_text = format_hits_for_prompt(hits, max_total_chars=800)
+        except Exception:  # noqa: BLE001
+            ctx_text = ""
+
         user = (
             f"<<< PREFIX\n{prefix}\n<<< SUFFIX\n{suffix}\n"
             f"<<< CONTINUE\n请续写 PREFIX 与 SUFFIX 之间的衔接文字。"
         )
-        # 改 max_tokens / temperature
-        cfg.max_tokens = 128
+        if ctx_text:
+            user = user + "\n\n<<< WORKSPACE_CONTEXT\n" + ctx_text
+
+        cfg.max_tokens = max_tok
         cfg.temperature = 0.6
         client = LLMClient(cfg)
-        # 起线程
         self._stop_completion()
+        self._completion_mode = mode
         self._completion_thread = QThread(self)
         self._completion_worker = _LLMWorker(client, [
-            {"role": "system", "content": system},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user},
         ])
         self._completion_worker.moveToThread(self._completion_thread)
@@ -592,7 +635,6 @@ class EditorPanel(QFrame):
         self._completion_worker.failed.connect(self._completion_thread.quit)
         self._completion_thread.finished.connect(self._cleanup_completion_thread)
         self._completion_thread.start()
-        # 记录锚点
         self._ghost_anchor = pos
 
     def _on_completion_done(self, full: str):
@@ -1016,6 +1058,7 @@ class AssistantPanel(QFrame):
         self._active_agent: WriteAgentPreset = get_preset(load_active_preset())
         self._quotes: List[str] = []  # 引用选区列表
         self._max_quotes = 5
+        self._quote_expanded: bool = False  # 引用列表是否展开
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
@@ -1408,17 +1451,15 @@ class AssistantPanel(QFrame):
         self.doc_path.setText(text)
         self.doc_path.setToolTip(str(p))
 
-    # ---------- 引用选区 ----------
+    # ---------- 引用选区(折叠分页) ----------
     def _on_quote(self):
         sel = self.editor.selected_text()
         if not sel:
             QMessageBox.information(self, "无选中文本", "请先在编辑器里选中要引用的文本。")
             return
         if len(self._quotes) >= self._max_quotes:
-            QMessageBox.information(
-                self, "已达上限",
-                f"引用列表最多 {self._max_quotes} 条,请先删除部分再添加。")
-            return
+            # 超过上限:清掉最旧的(保留最新的)
+            self._quotes.pop(0)
         self._quotes.append(sel)
         self._render_quotes()
 
@@ -1430,8 +1471,15 @@ class AssistantPanel(QFrame):
             if w is not None:
                 w.deleteLater()
         # 重新填充
-        self.quote_header.setText(f"引用 · {len(self._quotes)}/{self._max_quotes}")
-        for i, q in enumerate(self._quotes):
+        n = len(self._quotes)
+        self.quote_header.setText(f"引用 · {n}/{self._max_quotes}")
+        # 折叠:超过 _collapsed_show 条时折叠
+        collapsed_show = 3
+        show_all = self._quote_expanded or n <= collapsed_show
+        items = list(enumerate(self._quotes))
+        if not show_all:
+            items = items[:collapsed_show]
+        for i, q in items:
             row = QHBoxLayout()
             row.setSpacing(4)
             preview = q.replace("\n", " ")
@@ -1455,16 +1503,33 @@ class AssistantPanel(QFrame):
             )
             del_btn.clicked.connect(lambda _, idx=i: self._del_quote(idx))
             row.addWidget(del_btn)
-            # 用 QWidget 容器承载 row
             wrap = QWidget()
             wrap.setStyleSheet("background: transparent; border: none;")
             wrap.setLayout(row)
             self.quote_items_layout.addWidget(wrap)
+        # 折叠/展开按钮
+        if n > collapsed_show:
+            toggle_text = ("收起" if show_all
+                           else f"…展开剩余 {n - collapsed_show} 条")
+            toggle_btn = QToolButton()
+            toggle_btn.setText(toggle_text)
+            toggle_btn.setCursor(Qt.PointingHandCursor)
+            toggle_btn.setStyleSheet(
+                f"QToolButton {{ background: transparent; color: {ACCENT};"
+                f"  border: none; font-size: 10px; padding: 2px 4px; text-align: left; }}"
+                f"QToolButton:hover {{ color: {ACCENT_HOVER}; }}"
+            )
+            toggle_btn.clicked.connect(self._toggle_quotes_expand)
+            self.quote_items_layout.addWidget(toggle_btn)
         # 控制显隐
         if self._quotes:
             self.quote_box.show()
         else:
             self.quote_box.hide()
+
+    def _toggle_quotes_expand(self):
+        self._quote_expanded = not self._quote_expanded
+        self._render_quotes()
 
     def _del_quote(self, idx: int):
         if 0 <= idx < len(self._quotes):
@@ -1559,6 +1624,19 @@ class AssistantPanel(QFrame):
                 for q in self._quotes
             )
             user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
+        # BM25 工作区上下文(chat 模式 + 文档大时)
+        if action.mode == "chat":
+            try:
+                from src.core.bm25 import search_workspace, format_hits_for_prompt
+                from src.core.write_agent import default_workspace_root
+                ws_root = default_workspace_root()
+                query = sel[:200] if sel else self.editor.toPlainText()[:200]
+                hits = search_workspace(ws_root, query, k=3, snippet_chars=520)
+                ctx = format_hits_for_prompt(hits, max_total_chars=1500)
+                if ctx:
+                    user_msg = f"{user_msg}\n\n---\n[工作区相关片段,供参考]\n{ctx}"
+            except Exception:  # noqa: BLE001
+                pass
 
         messages = [
             {"role": "system", "content": agent_system},
