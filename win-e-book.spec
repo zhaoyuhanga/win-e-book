@@ -27,6 +27,7 @@ a = Analysis(
         'src.core.library',
         'src.core.online',
         'src.core.llm',
+        'src.core.write_agent',
         'src.ui',
         'src.ui.main_window',
         'src.ui.library_view',
@@ -35,6 +36,7 @@ a = Analysis(
         'src.ui.home_view',
         'src.ui.write_view',
         'src.ui.llm_settings_dialog',
+        'src.ui.markdown_highlighter',
         'src.ui.theme',
         # 第三方依赖
         'ebooklib',

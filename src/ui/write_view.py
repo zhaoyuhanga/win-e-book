@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional, List
 
-from PySide6.QtCore import Qt, Signal, QThread, QObject, QSettings, QDir, QSize
+from PySide6.QtCore import Qt, Signal, QThread, QObject, QSettings, QDir, QSize, QTimer
 from PySide6.QtGui import QAction, QFont, QTextCursor, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QLineEdit, QTextEdit,
@@ -25,11 +25,17 @@ from src.core.llm import (
     LLMClient, LLMConfig, load_config, save_config, build_messages,
     WRITE_PRESETS, LLMError,
 )
+from src.core.write_agent import (
+    BUILTIN_PRESETS, QUICK_ACTIONS, QuickAction, WriteAgentPreset,
+    get_preset, get_quick_action, build_agent_system, load_active_preset,
+    save_active_preset,
+)
 from src.ui.theme import (
     BG, SURFACE, SURFACE_RAISED, BORDER, BORDER_FOCUS, ACCENT, ACCENT_HOVER,
     TEXT, TEXT_SECONDARY, TEXT_MUTED, FONT_HEADING, FONT_BODY, RADIUS, RADIUS_SM,
     SUCCESS, DANGER, TAG_BG,
 )
+from src.ui.markdown_highlighter import MarkdownHighlighter
 
 
 # ============================================================
@@ -287,6 +293,7 @@ class EditorPanel(QFrame):
                 border: 1px solid {SUCCESS};
             }}
         """)
+        self.live_toggle.toggled.connect(self._on_live_toggled)
         tb.addWidget(self.live_toggle)
 
         # 字号
@@ -379,6 +386,38 @@ class EditorPanel(QFrame):
         self.editor.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.editor, 1)
 
+        # Live 模式下的 Markdown 高亮
+        self._highlighter = MarkdownHighlighter(self.editor.document())
+        self._highlighter.setDocument(self.editor.document())
+
+        # 在线补全(短):浮动 ghost 文本
+        self._ghost_label = QLabel(self.editor)
+        self._ghost_label.setStyleSheet(
+            "QLabel {"
+            " color: #9aa0ac;"
+            " font-style: italic;"
+            " background: transparent;"
+            " border: none;"
+            " padding: 0;"
+            "}"
+        )
+        self._ghost_label.hide()
+        self._ghost_text: str = ""
+        self._ghost_anchor: int = 0  # ghost 锚点位置
+        self._completion_timer = QTimer(self)
+        self._completion_timer.setSingleShot(True)
+        self._completion_timer.timeout.connect(self._trigger_completion)
+        self._completion_thread: Optional[QThread] = None
+        self._completion_worker: Optional[_LLMWorker] = None
+        self._completion_ctx_cache: Tuple[int, int] = (0, 0)  # (pos, sel_len) 去重
+        # 默认 debounce
+        from PySide6.QtCore import QSettings
+        cs = QSettings("WinEBook", "InlineCompletion")
+        self._completion_enabled: bool = cs.value("enabled", True, type=bool)
+        self._completion_debounce_ms: int = cs.value("debounce_ms", 800, type=int)
+        if not self._completion_enabled:
+            self._completion_timer.stop()
+
         # ---------- 底部状态栏 ----------
         statusbar = QFrame()
         statusbar.setFixedHeight(24)
@@ -414,6 +453,9 @@ class EditorPanel(QFrame):
 
         layout.addWidget(statusbar)
 
+        # 初始化内联 Agent 编辑
+        self._setup_inline_agent()
+
     # ---------- 操作 ----------
     def open_file(self, path: str):
         """加载文件内容。"""
@@ -444,9 +486,18 @@ class EditorPanel(QFrame):
         self.editor.setFocus()
 
     def _on_text_changed(self):
+        # 防御:初始化期间可能触发
+        if not hasattr(self, "status_label") or self.status_label is None:
+            return
         self._update_word_count()
         if self._live_mode and self._file_path and self.live_toggle.isChecked():
             self._save_label_delayed()
+        # 触发在线补全(短)
+        if self._completion_enabled and self.live_toggle.isChecked():
+            # 已经有 ghost 的话,先清掉
+            self._hide_ghost()
+            # 重新计时
+            self._completion_timer.start(self._completion_debounce_ms)
 
     def _save_label_delayed(self):
         self.save_label.setText("保存中…")
@@ -477,6 +528,437 @@ class EditorPanel(QFrame):
         self.editor.setFont(font)
         self.font_label.setText(str(new_size))
 
+    def _on_live_toggled(self, checked: bool):
+        """Live 模式:开关 Markdown 实时高亮 + 在线补全。"""
+        if checked:
+            self._highlighter.setDocument(self.editor.document())
+        else:
+            self._highlighter.setDocument(None)
+            self._hide_ghost()
+            self._completion_timer.stop()
+        self._highlighter.rehighlight()
+
+    # ---------- 在线补全(短) ----------
+    def _trigger_completion(self):
+        """防抖到期:取上下文,调 LLM 拿补全。"""
+        from src.core.llm import LLMClient, load_config
+        cfg = load_config()
+        if not cfg.is_valid():
+            return
+        # 取光标位置
+        cursor = self.editor.textCursor()
+        pos = cursor.position()
+        full = self.editor.toPlainText()
+        # 抽前 1500 + 后 500
+        prefix = full[max(0, pos - 1500):pos]
+        suffix = full[pos:pos + 500]
+        # 跳过空白/换行:不补全
+        if not prefix.strip():
+            return
+        # 跳过用户在选区中
+        if cursor.hasSelection():
+            return
+        # 避免重复请求(同样的 pos + 文本)
+        cache_key = (pos, hash(prefix[-100:]))
+        if cache_key == getattr(self, "_last_completion_key", None):
+            return
+        self._last_completion_key = cache_key
+
+        system = (
+            "你是一位中文写作助手,任务是根据上下文续写下一句或下一段。"
+            "只输出续写的内容,不要重复前缀或后缀,不要解释,不要带引号。"
+            "长度控制在 8-80 字以内。"
+        )
+        user = (
+            f"<<< PREFIX\n{prefix}\n<<< SUFFIX\n{suffix}\n"
+            f"<<< CONTINUE\n请续写 PREFIX 与 SUFFIX 之间的衔接文字。"
+        )
+        # 改 max_tokens / temperature
+        cfg.max_tokens = 128
+        cfg.temperature = 0.6
+        client = LLMClient(cfg)
+        # 起线程
+        self._stop_completion()
+        self._completion_thread = QThread(self)
+        self._completion_worker = _LLMWorker(client, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
+        self._completion_worker.moveToThread(self._completion_thread)
+        self._completion_thread.started.connect(self._completion_worker.run)
+        self._completion_worker.finished.connect(self._on_completion_done)
+        self._completion_worker.failed.connect(self._on_completion_failed)
+        self._completion_worker.finished.connect(self._completion_thread.quit)
+        self._completion_worker.failed.connect(self._completion_thread.quit)
+        self._completion_thread.finished.connect(self._cleanup_completion_thread)
+        self._completion_thread.start()
+        # 记录锚点
+        self._ghost_anchor = pos
+
+    def _on_completion_done(self, full: str):
+        if not full.strip():
+            return
+        # 截掉多余的引号/前缀
+        text = full.strip()
+        for prefix in ("```", "「", "「「"):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        text = text.split("\n\n")[0]  # 只取第一段
+        if not text:
+            return
+        self._ghost_text = text
+        self._show_ghost()
+
+    def _on_completion_failed(self, err: str):
+        # 静默失败
+        self._hide_ghost()
+
+    def _stop_completion(self):
+        if self._completion_thread and self._completion_thread.isRunning():
+            self._completion_thread.quit()
+            self._completion_thread.wait(500)
+        self._cleanup_completion_thread()
+
+    def _cleanup_completion_thread(self):
+        if self._completion_worker:
+            self._completion_worker.deleteLater()
+            self._completion_worker = None
+        if self._completion_thread:
+            self._completion_thread.deleteLater()
+            self._completion_thread = None
+
+    def _show_ghost(self):
+        """把 ghost 文本浮在光标位置。"""
+        if not self._ghost_text:
+            return
+        # 取光标在 viewport 中的矩形
+        cursor = self.editor.textCursor()
+        rect = self.editor.cursorRect(cursor)
+        # 转为编辑器 widget 坐标
+        x = rect.right() + 2
+        y = rect.top()
+        self._ghost_label.setText(self._ghost_text)
+        self._ghost_label.adjustSize()
+        # 限制 ghost 宽度,避免溢出
+        max_w = self.editor.viewport().width() - x - 16
+        if self._ghost_label.width() > max_w > 100:
+            self._ghost_label.setFixedWidth(max_w)
+            self._ghost_label.setWordWrap(True)
+        else:
+            self._ghost_label.setWordWrap(False)
+        self._ghost_label.move(x, y)
+        self._ghost_label.raise_()
+        self._ghost_label.show()
+
+    def _hide_ghost(self):
+        self._ghost_text = ""
+        self._ghost_label.hide()
+
+    def _accept_ghost(self):
+        """Tab:接受 ghost 文本。"""
+        if not self._ghost_text:
+            return False
+        cursor = self.editor.textCursor()
+        cursor.insertText(self._ghost_text)
+        self._hide_ghost()
+        return True
+
+    def keyPressEvent(self, ev):  # noqa: N802
+        # Tab 接受 ghost
+        if ev.key() == Qt.Key_Tab and self._ghost_text:
+            if self._accept_ghost():
+                ev.accept()
+                return
+        # Esc 取消 ghost
+        if ev.key() == Qt.Key_Escape and self._ghost_text:
+            self._hide_ghost()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    # ---------- 内联 Agent 编辑(浮动窗) ----------
+    def _setup_inline_agent(self):
+        # ✨ 浮动按钮(选区时显示)
+        self._btn_ai_edit = QToolButton(self.editor)
+        self._btn_ai_edit.setText("✨")
+        self._btn_ai_edit.setToolTip("AI 改写选区")
+        self._btn_ai_edit.setCursor(Qt.PointingHandCursor)
+        self._btn_ai_edit.setFixedSize(28, 28)
+        self._btn_ai_edit.setStyleSheet(f"""
+            QToolButton {{
+                background: {ACCENT};
+                color: #0f1724;
+                border: none;
+                border-radius: 14px;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QToolButton:hover {{
+                background: {ACCENT_HOVER};
+            }}
+        """)
+        self._btn_ai_edit.hide()
+        self._btn_ai_edit.clicked.connect(self._show_inline_agent)
+
+        # 浮动 Agent 框
+        self._inline_agent = QFrame(self.editor)
+        self._inline_agent.setObjectName("InlineAgent")
+        self._inline_agent.setStyleSheet(f"""
+            QFrame#InlineAgent {{
+                background: {SURFACE};
+                border: 1px solid {ACCENT};
+                border-radius: 8px;
+            }}
+        """)
+        self._inline_agent.setFixedWidth(380)
+        self._inline_agent.setFixedHeight(280)
+        ial = QVBoxLayout(self._inline_agent)
+        ial.setContentsMargins(10, 8, 10, 8)
+        ial.setSpacing(6)
+
+        # 顶部:标题 + 关闭
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        title = QLabel("✨ AI 改写")
+        title.setStyleSheet(f"color: {TEXT}; font-size: 12px; font-weight: 700;"
+                           f" background: transparent; border: none;")
+        head.addWidget(title)
+        head.addStretch(1)
+        self._ia_close = QToolButton()
+        self._ia_close.setText("×")
+        self._ia_close.setFixedSize(18, 18)
+        self._ia_close.setCursor(Qt.PointingHandCursor)
+        self._ia_close.setStyleSheet(
+            f"QToolButton {{ background: transparent; color: {TEXT_MUTED};"
+            f"  border: none; font-size: 14px; padding: 0; }}"
+            f"QToolButton:hover {{ color: {DANGER}; }}"
+        )
+        self._ia_close.clicked.connect(self._hide_inline_agent)
+        head.addWidget(self._ia_close)
+        ial.addLayout(head)
+
+        # 选区预览
+        self._ia_selection = QLabel("(选区)")
+        self._ia_selection.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 10px; background: {SURFACE_RAISED};"
+            f" border: 1px solid {BORDER}; border-radius: 4px; padding: 4px 6px;"
+        )
+        self._ia_selection.setWordWrap(True)
+        self._ia_selection.setMaximumHeight(40)
+        ial.addWidget(self._ia_selection)
+
+        # 输入框
+        self._ia_input = QLineEdit()
+        self._ia_input.setPlaceholderText("输入改写指令,如:改得更正式 / 加一个比喻 / 缩短一半…")
+        self._ia_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: {BG};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 5px 8px;
+                font-size: 11px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+        """)
+        self._ia_input.returnPressed.connect(self._send_inline_agent)
+        ial.addWidget(self._ia_input)
+
+        # 发送按钮
+        send_row = QHBoxLayout()
+        send_row.setSpacing(6)
+        send_row.addStretch(1)
+        self._ia_send = QPushButton("发送")
+        self._ia_send.setCursor(Qt.PointingHandCursor)
+        self._ia_send.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {ACCENT};
+                border: 1px solid {ACCENT}; border-radius: 4px;
+                padding: 3px 12px; font-size: 11px;
+            }}
+            QPushButton:hover {{ background: {ACCENT}; color: #0f1724; }}
+            QPushButton:disabled {{ color: {TEXT_MUTED}; border: 1px solid {TEXT_MUTED}; }}
+        """)
+        self._ia_send.clicked.connect(self._send_inline_agent)
+        send_row.addWidget(self._ia_send)
+        ial.addLayout(send_row)
+
+        # 结果区
+        ial.addWidget(QLabel("生成结果:"))
+        self._ia_result = QTextEdit()
+        self._ia_result.setReadOnly(True)
+        self._ia_result.setStyleSheet(f"""
+            QTextEdit {{
+                background: {BG}; color: {TEXT};
+                border: 1px solid {BORDER}; border-radius: 4px;
+                padding: 5px 7px; font-size: 11px; line-height: 1.5;
+            }}
+        """)
+        self._ia_result.setPlaceholderText("(等待生成)")
+        ial.addWidget(self._ia_result, 1)
+
+        # 应用/重生成
+        apply_row = QHBoxLayout()
+        apply_row.setSpacing(6)
+        self._ia_apply = QPushButton("✓ 应用到选区")
+        self._ia_apply.setCursor(Qt.PointingHandCursor)
+        self._ia_apply.setEnabled(False)
+        self._ia_apply.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT}; color: #0f1724; border: none;
+                border-radius: 4px; padding: 4px 10px; font-size: 11px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{ background: {ACCENT_HOVER}; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_MUTED}; }}
+        """)
+        self._ia_apply.clicked.connect(self._apply_inline_agent)
+        apply_row.addWidget(self._ia_apply)
+
+        self._ia_regen = QPushButton("↻ 重生成")
+        self._ia_regen.setCursor(Qt.PointingHandCursor)
+        self._ia_regen.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {TEXT_SECONDARY};
+                border: 1px solid {BORDER}; border-radius: 4px;
+                padding: 4px 10px; font-size: 11px;
+            }}
+            QPushButton:hover {{ color: {ACCENT}; border: 1px solid {ACCENT}; }}
+        """)
+        self._ia_regen.clicked.connect(self._send_inline_agent)
+        apply_row.addWidget(self._ia_regen)
+        apply_row.addStretch(1)
+        ial.addLayout(apply_row)
+
+        self._inline_agent.hide()
+        self._ia_original: str = ""
+        self._ia_thread: Optional[QThread] = None
+        self._ia_worker: Optional[_LLMWorker] = None
+        # selectionChanged 信号
+        self.editor.selectionChanged.connect(self._on_selection_changed)
+
+    def _on_selection_changed(self):
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection() and len(cursor.selectedText()) >= 2:
+            rect = self.editor.cursorRect(cursor)
+            # 选区上方一点点
+            x = max(0, rect.left() - 30)
+            y = max(0, rect.top() - 32)
+            self._btn_ai_edit.move(x, y)
+            self._btn_ai_edit.show()
+        else:
+            self._btn_ai_edit.hide()
+            # 不自动关 inline_agent,让用户自己决定
+
+    def _show_inline_agent(self):
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            return
+        sel = cursor.selectedText()
+        self._ia_original = sel
+        # 预览:截前 80 字
+        preview = sel.replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:80] + "…"
+        self._ia_selection.setText(f"选区: {preview}")
+        # 定位到选区下方
+        rect = self.editor.cursorRect(cursor)
+        x = max(0, rect.left())
+        y = rect.bottom() + 6
+        # 不要超出编辑器
+        max_x = self.editor.viewport().width() - self._inline_agent.width()
+        if x > max_x:
+            x = max(0, max_x)
+        self._inline_agent.move(x, y)
+        self._inline_agent.show()
+        self._inline_agent.raise_()
+        self._ia_input.clear()
+        self._ia_input.setFocus()
+        self._ia_result.clear()
+        self._ia_apply.setEnabled(False)
+
+    def _hide_inline_agent(self):
+        self._inline_agent.hide()
+        self._stop_inline_agent()
+
+    def _send_inline_agent(self):
+        if self._ia_thread and self._ia_thread.isRunning():
+            return
+        from src.core.llm import LLMClient, load_config
+        cfg = load_config()
+        if not cfg.is_valid():
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "未配置 LLM", "请先在助手面板右上角「⚙」配置。")
+            return
+        instruction = self._ia_input.text().strip() or "润色这段文本,保持原意"
+        system = (
+            "你是一位行内编辑。任务是根据用户指令改写指定文本。\n"
+            "保持原意,只调整表达、节奏、措辞。\n"
+            f"用户指令:{instruction}\n"
+            "输出**仅修改后的文本**,不带引号、不带解释、不带'改写后:'等前缀。"
+        )
+        user = f"原文:\n{self._ia_original}"
+        client = LLMClient(cfg)
+        self._ia_result.clear()
+        self._ia_apply.setEnabled(False)
+        self._ia_send.setEnabled(False)
+        self._ia_send.setText("生成中…")
+        self._ia_thread = QThread(self)
+        self._ia_worker = _LLMWorker(client, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ])
+        self._ia_worker.moveToThread(self._ia_thread)
+        self._ia_thread.started.connect(self._ia_worker.run)
+        self._ia_worker.chunk.connect(self._ia_on_chunk)
+        self._ia_worker.finished.connect(self._ia_on_done)
+        self._ia_worker.failed.connect(self._ia_on_failed)
+        self._ia_worker.finished.connect(self._ia_thread.quit)
+        self._ia_worker.failed.connect(self._ia_thread.quit)
+        self._ia_thread.finished.connect(self._cleanup_ia_thread)
+        self._ia_thread.start()
+
+    def _ia_on_chunk(self, delta: str):
+        cur = self._ia_result.toPlainText()
+        self._ia_result.setPlainText(cur + delta)
+        sb = self._ia_result.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _ia_on_done(self, full: str):
+        self._ia_send.setEnabled(True)
+        self._ia_send.setText("发送")
+        self._ia_apply.setEnabled(bool(full.strip()))
+
+    def _ia_on_failed(self, err: str):
+        self._ia_send.setEnabled(True)
+        self._ia_send.setText("发送")
+        self._ia_result.setPlainText(f"[错误] {err}")
+
+    def _apply_inline_agent(self):
+        new_text = self._ia_result.toPlainText().strip()
+        if not new_text or not self._ia_original:
+            return
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            cursor.insertText(new_text)
+        else:
+            self.editor.insert_text(new_text)
+        self._hide_inline_agent()
+
+    def _stop_inline_agent(self):
+        if self._ia_thread and self._ia_thread.isRunning():
+            self._ia_thread.quit()
+            self._ia_thread.wait(500)
+        self._cleanup_ia_thread()
+
+    def _cleanup_ia_thread(self):
+        if self._ia_worker:
+            self._ia_worker.deleteLater()
+            self._ia_worker = None
+        if self._ia_thread:
+            self._ia_thread.deleteLater()
+            self._ia_thread = None
+
     def _on_readonly_toggled(self, checked: bool):
         self.editor.setReadOnly(checked)
 
@@ -500,6 +982,8 @@ class EditorPanel(QFrame):
             QMessageBox.warning(self, "导出失败", str(e))
 
     def _update_word_count(self):
+        if not hasattr(self, "status_label") or self.status_label is None:
+            return
         text = self.editor.toPlainText()
         n = len([c for c in text if c.strip()])
         self.status_label.setText(f"字数: {n}")
@@ -529,6 +1013,9 @@ class AssistantPanel(QFrame):
         self._thread: Optional[QThread] = None
         self._worker: Optional[_LLMWorker] = None
         self._current_preset: Optional[str] = None
+        self._active_agent: WriteAgentPreset = get_preset(load_active_preset())
+        self._quotes: List[str] = []  # 引用选区列表
+        self._max_quotes = 5
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 10)
@@ -558,6 +1045,55 @@ class AssistantPanel(QFrame):
         self.btn_settings.clicked.connect(self._open_settings)
         head.addWidget(self.btn_settings)
         layout.addLayout(head)
+
+        # Agent 人设选择器
+        agent_row = QHBoxLayout()
+        agent_row.setSpacing(4)
+        agent_lbl = QLabel("人设:")
+        agent_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 10px; background: transparent;")
+        agent_row.addWidget(agent_lbl)
+
+        self.cmb_agent = QComboBox()
+        self.cmb_agent.setStyleSheet(f"""
+            QComboBox {{
+                background: {SURFACE_RAISED};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS_XS}px;
+                padding: 3px 8px;
+                font-size: 11px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 16px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid {TEXT_MUTED};
+                margin-right: 4px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: {SURFACE};
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                selection-background-color: {ACCENT};
+                selection-color: #0f1724;
+                padding: 4px;
+                font-size: 11px;
+            }}
+        """)
+        for p in BUILTIN_PRESETS:
+            self.cmb_agent.addItem(f"{p.emoji}  {p.name}", p.id)
+        idx = next((i for i, p in enumerate(BUILTIN_PRESETS) if p.id == self._active_agent.id), 0)
+        self.cmb_agent.setCurrentIndex(idx)
+        self.cmb_agent.currentIndexChanged.connect(self._on_agent_changed)
+        agent_row.addWidget(self.cmb_agent, 1)
+        layout.addLayout(agent_row)
 
         # 当前文档路径
         self.doc_path = QLabel("海鲸/海鲸:海军史上最大败类.txt")
@@ -634,11 +1170,33 @@ class AssistantPanel(QFrame):
         layout.addWidget(preset_label)
 
         self.preset_buttons: List[QFrame] = []
-        # 只显示 3 个最常用的(图里能看到 3 个)
-        for key in ["总结", "大纲", "润色"]:
-            btn = self._make_preset_btn(key, WRITE_PRESETS[key])
+        # 7 种快捷操作(对应 PRD §5.2)
+        for action in QUICK_ACTIONS:
+            btn = self._make_quick_action_btn(action)
             layout.addWidget(btn)
             self.preset_buttons.append(btn)
+
+        # ---------- 引用选区列表(条件显示) ----------
+        self.quote_box = QFrame()
+        self.quote_box.setStyleSheet(f"""
+            QFrame {{
+                background: {SURFACE_RAISED};
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS_SM}px;
+            }}
+        """)
+        qb = QVBoxLayout(self.quote_box)
+        qb.setContentsMargins(8, 6, 8, 6)
+        qb.setSpacing(3)
+        self.quote_header = QLabel(f"引用 · 0/{self._max_quotes}")
+        self.quote_header.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 9px; background: transparent; border: none;")
+        qb.addWidget(self.quote_header)
+        self.quote_items_layout = QVBoxLayout()
+        self.quote_items_layout.setSpacing(2)
+        qb.addLayout(self.quote_items_layout)
+        self.quote_box.hide()
+        layout.addWidget(self.quote_box)
 
         # ---------- 响应区(可滚动) ----------
         self.response = QTextEdit()
@@ -682,7 +1240,7 @@ class AssistantPanel(QFrame):
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
-        self.btn_quote = QPushButton("📎 引用")
+        self.btn_quote = QPushButton("📎 引用选区")
         self.btn_quote.setCursor(Qt.PointingHandCursor)
         self.btn_quote.setStyleSheet(f"""
             QPushButton {{
@@ -701,8 +1259,9 @@ class AssistantPanel(QFrame):
         self.btn_quote.clicked.connect(self._on_quote)
         action_row.addWidget(self.btn_quote)
 
-        self.btn_insert = QPushButton("↳ 插入")
+        self.btn_insert = QPushButton("↳ 应用替换")
         self.btn_insert.setCursor(Qt.PointingHandCursor)
+        self.btn_insert.setToolTip("用 AI 响应替换编辑器中的原选区")
         self.btn_insert.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
@@ -763,61 +1322,63 @@ class AssistantPanel(QFrame):
         self.model_label.setAlignment(Qt.AlignRight)
         layout.addWidget(self.model_label)
 
-    # ---------- 预设按钮 ----------
-    def _make_preset_btn(self, key: str, meta: dict):
-        """预设动作卡(QFrame 替代 QPushButton,正确处理内部 layout)。"""
-        label = meta["label"]
-        desc_map = {
-            "总结": "提炼结构、主题和缺口",
-            "大纲": "整理标题和段落推进",
-            "润色": "先选中文本会自动带引用",
-        }
-        desc = desc_map.get(key, "")
-
+    # ---------- 快捷操作按钮 ----------
+    def _make_quick_action_btn(self, action: QuickAction):
+        """快捷操作按钮(QFrame 替代 QPushButton,正确处理内部 layout)。"""
         btn = QFrame()
-        btn.setObjectName(f"PresetBtn_{key}")
+        btn.setObjectName(f"QuickAction_{action.id}")
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(48)
+        btn.setFixedHeight(42)
         btn.setStyleSheet(f"""
-            QFrame#PresetBtn_{key} {{
+            QFrame#QuickAction_{action.id} {{
                 background: {SURFACE_RAISED};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS_SM}px;
             }}
-            QFrame#PresetBtn_{key}:hover {{
+            QFrame#QuickAction_{action.id}:hover {{
                 border: 1px solid {ACCENT};
                 background: {BG};
             }}
         """)
 
-        wrap = QVBoxLayout(btn)
-        wrap.setContentsMargins(12, 6, 12, 6)
-        wrap.setSpacing(1)
+        # 横向布局:左标签,右模式徽标
+        h = QHBoxLayout(btn)
+        h.setContentsMargins(10, 4, 8, 4)
+        h.setSpacing(6)
 
-        t = QLabel(label)
+        t = QLabel(f"{action.label}  ·  {action.desc}")
         t.setStyleSheet(
-            f"color: {TEXT}; font-size: 12px; font-weight: 600;"
+            f"color: {TEXT}; font-size: 11px;"
             f" background: transparent; border: none;"
         )
-        wrap.addWidget(t)
+        h.addWidget(t, 1)
 
-        d = QLabel(desc)
-        d.setStyleSheet(
-            f"color: {TEXT_MUTED}; font-size: 10px;"
-            f" background: transparent; border: none;"
+        # 模式徽标(chat/edit)
+        mode_badge = QLabel(action.mode)
+        mode_badge.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 9px; font-weight: 600;"
+            f" background: transparent; border: 1px solid {BORDER};"
+            f" border-radius: 3px; padding: 1px 4px;"
         )
-        wrap.addWidget(d)
+        h.addWidget(mode_badge)
 
-        # 自己处理 click
-        def _click(ev, k=key):
+        # 处理 click
+        def _click(ev, a=action):
             if ev.button() == Qt.LeftButton:
-                self._run_preset(k)
+                self._run_quick_action(a)
         btn.mousePressEvent = _click
         return btn
 
-    # 兼容老接口(如果在外部调用 .clicked)
+    # 兼容老接口
     def _click(self):
         pass
+
+    # ---------- Agent 人设切换 ----------
+    def _on_agent_changed(self, idx: int):
+        pid = self.cmb_agent.itemData(idx)
+        if pid:
+            self._active_agent = get_preset(pid)
+            save_active_preset(pid)
 
     # ---------- 状态 ----------
     def _update_model_label(self):
@@ -847,22 +1408,88 @@ class AssistantPanel(QFrame):
         self.doc_path.setText(text)
         self.doc_path.setToolTip(str(p))
 
-    # ---------- 交互 ----------
+    # ---------- 引用选区 ----------
     def _on_quote(self):
         sel = self.editor.selected_text()
         if not sel:
             QMessageBox.information(self, "无选中文本", "请先在编辑器里选中要引用的文本。")
             return
-        cur = self.input.toPlainText().rstrip()
-        quote = "\n\n> " + sel.replace("\n", "\n> ")
-        self.input.setPlainText((cur + quote) if cur else quote.lstrip())
-        self.input.setFocus()
+        if len(self._quotes) >= self._max_quotes:
+            QMessageBox.information(
+                self, "已达上限",
+                f"引用列表最多 {self._max_quotes} 条,请先删除部分再添加。")
+            return
+        self._quotes.append(sel)
+        self._render_quotes()
+
+    def _render_quotes(self):
+        # 清空旧的
+        while self.quote_items_layout.count():
+            it = self.quote_items_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        # 重新填充
+        self.quote_header.setText(f"引用 · {len(self._quotes)}/{self._max_quotes}")
+        for i, q in enumerate(self._quotes):
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            preview = q.replace("\n", " ")
+            if len(preview) > 60:
+                preview = preview[:60] + "…"
+            lbl = QLabel(f"{i+1}. {preview}")
+            lbl.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+                f" border: none;"
+            )
+            lbl.setToolTip(q)
+            row.addWidget(lbl, 1)
+            del_btn = QToolButton()
+            del_btn.setText("×")
+            del_btn.setFixedSize(16, 16)
+            del_btn.setCursor(Qt.PointingHandCursor)
+            del_btn.setStyleSheet(
+                f"QToolButton {{ background: transparent; color: {TEXT_MUTED};"
+                f"  border: none; font-size: 13px; padding: 0; }}"
+                f"QToolButton:hover {{ color: {DANGER}; }}"
+            )
+            del_btn.clicked.connect(lambda _, idx=i: self._del_quote(idx))
+            row.addWidget(del_btn)
+            # 用 QWidget 容器承载 row
+            wrap = QWidget()
+            wrap.setStyleSheet("background: transparent; border: none;")
+            wrap.setLayout(row)
+            self.quote_items_layout.addWidget(wrap)
+        # 控制显隐
+        if self._quotes:
+            self.quote_box.show()
+        else:
+            self.quote_box.hide()
+
+    def _del_quote(self, idx: int):
+        if 0 <= idx < len(self._quotes):
+            self._quotes.pop(idx)
+            self._render_quotes()
+
+    # ---------- 交互 ----------
+    def _on_quote_OLD_KEEP_COMPAT(self):  # 占位防止被覆盖(实际已被 _on_quote 替换)
+        pass
 
     def _on_insert(self):
+        """edit 模式:用 AI 输出替换编辑器选区;chat 模式:插入到光标。"""
         text = self.response.toPlainText().strip()
         if not text:
             return
-        self.editor.insert_text("\n\n" + text + "\n\n")
+        if getattr(self, "_edit_action_mode", False):
+            # 替换原选区
+            cursor = self.editor.editor.textCursor()
+            if cursor.hasSelection():
+                cursor.insertText(text)
+            else:
+                self.editor.insert_text(text)
+        else:
+            # 插入到光标
+            self.editor.insert_text("\n\n" + text + "\n\n")
         self.btn_insert.setEnabled(False)
 
     def _on_send(self):
@@ -874,38 +1501,72 @@ class AssistantPanel(QFrame):
                 self, "未配置 LLM",
                 "请先在右上角「⚙」配置 API key / base_url / model。")
             return
-        # 自定义提问 → 用 "问答" 预设
+        # 自定义提问 → 用当前人设作为 system
         ctx = self.editor.toPlainText()
         if len(ctx) > 8000:
             ctx = ctx[:8000] + "…(已截断)"
-        messages = build_messages(
-            "问答",
-            question=f"{question}\n\n---\n(以下为当前文档内容供参考,可能很长)\n\n{ctx}",
-        )
+        user_msg = f"{question}\n\n---\n(以下为当前文档内容供参考,可能很长)\n\n{ctx}"
+        if self._quotes:
+            quote_text = "\n\n".join(
+                f"> {q[:300]}{'…' if len(q) > 300 else ''}"
+                for q in self._quotes
+            )
+            user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
+        agent_system = build_agent_system(self._active_agent)
+        messages = [
+            {"role": "system", "content": agent_system},
+            {"role": "user", "content": user_msg},
+        ]
         self._current_preset = "问答"
+        self._edit_action_mode = False
         self._start_stream(messages)
 
-    def _run_preset(self, key: str):
+    def _run_quick_action(self, action: QuickAction):
+        """执行快捷操作。"""
         if self._thread is not None and self._thread.isRunning():
-            return  # 忙碌中
+            return
         if not self._llm_cfg.is_valid():
             QMessageBox.warning(
                 self, "未配置 LLM",
                 "请先在右上角「⚙」配置 API key / base_url / model。")
             return
-        self._current_preset = key
-        ctx = self.editor.toPlainText()
         sel = self.editor.selected_text()
-        # 截断过长上下文
-        if len(ctx) > 12000:
-            ctx = ctx[:12000] + "…(已截断)"
-        if key == "润色":
-            if not sel:
-                QMessageBox.information(self, "无选中文本", "请先在编辑器里选中要润色的文本。")
-                return
-            messages = build_messages(key, selection=sel)
+        if action.mode == "edit" and not sel:
+            QMessageBox.information(
+                self, "无选中文本",
+                f"「{action.label}」需要先在编辑器里选中要操作的文本。")
+            return
+
+        self._current_preset = action.id
+        # 构造 system prompt:人设 + 快捷操作 prompt
+        agent_system = build_agent_system(self._active_agent)
+        if action.mode == "edit":
+            # edit 模式:对选区做改写,要求模型只输出结果
+            user_msg = f"{action.prompt}\n\n---\n选中文本:\n{sel}"
         else:
-            messages = build_messages(key, context=ctx, anchor="此处", length="800")
+            # chat 模式:解释/批评,基于选区或全文
+            if sel:
+                user_msg = f"{action.prompt}\n\n---\n选中内容:\n{sel}"
+            else:
+                ctx = self.editor.toPlainText()
+                if len(ctx) > 12000:
+                    ctx = ctx[:12000] + "…(已截断)"
+                user_msg = f"{action.prompt}\n\n---\n当前文档:\n{ctx}"
+        # 加引用选区(如果有)
+        if self._quotes:
+            quote_text = "\n\n".join(
+                f"> {q[:300]}{'…' if len(q) > 300 else ''}"
+                for q in self._quotes
+            )
+            user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
+
+        messages = [
+            {"role": "system", "content": agent_system},
+            {"role": "user", "content": user_msg},
+        ]
+        # edit 模式 → 流式完后提供"应用替换"按钮
+        self._edit_action_mode = (action.mode == "edit")
+        self._edit_action_original = sel
         self._start_stream(messages)
 
     # ---------- 流式 ----------
