@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QLineEdit, QTextEdit,
     QPlainTextEdit, QTreeView, QFileSystemModel, QPushButton, QFileDialog,
     QMessageBox, QSizePolicy, QSplitter, QToolButton, QApplication, QComboBox,
-    QScrollArea, QMenu, QListWidget, QListWidgetItem, QLineEdit,
+    QScrollArea, QMenu, QListWidget, QListWidgetItem, QLineEdit, QTabWidget,
 )
 
 from src.core.llm import (
@@ -1748,6 +1748,12 @@ class AssistantPanel(QFrame):
         self._llm_cfg = load_config()
         self._update_model_label()
 
+    def set_editor(self, editor: "EditorPanel"):
+        """Phase 4b 多 Tab:切换当前 tab 的 editor 引用。"""
+        self.editor = editor
+        if editor and editor._file_path:
+            self.set_doc_path(editor._file_path)
+
     def set_doc_path(self, path: str):
         # 显示成 "海鲸/海鲸:海军史上最大败类.txt" 风格
         p = Path(path)
@@ -2256,6 +2262,16 @@ class CheckpointPanel(QFrame):
         if self._editor and self._editor.btn_history.isChecked():
             self._editor.btn_history.setChecked(False)
 
+    def set_editor(self, editor: "EditorPanel"):
+        """Phase 4b 多 Tab:切换当前 tab 的 editor 引用。"""
+        self._editor = editor
+        # 关掉历史按钮(checkpoint 是绑在 editor 上的)
+        if editor and editor.btn_history.isChecked():
+            editor.btn_history.setChecked(False)
+        # 刷新列表
+        if self.isVisible():
+            self.refresh()
+
     def refresh(self):
         """从 checkpoint 引擎读最新列表,刷新 UI。"""
         self.list.clear()
@@ -2410,11 +2426,16 @@ class CheckpointPanel(QFrame):
 
 
 class WriteView(QWidget):
-    """墨写主页面(三栏)。"""
+    """墨写主页面(三栏:文件树 / 多 Tab 编辑器 / AI 助手)。"""
+
+    # Tab 持久化的 QSettings key
+    _TABS_KEY = "WriteTabs"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._workspace = default_workspace()
+        # __init__ 期间屏蔽 _save_tabs(避免初始 _add_new_tab 写空 list 覆盖上次持久化)
+        self._suspend_save = True
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -2432,13 +2453,54 @@ class WriteView(QWidget):
         self.file_tree = FileTreePanel(self._workspace)
         splitter.addWidget(self.file_tree)
 
-        # 中
-        self.editor = EditorPanel()
-        splitter.addWidget(self.editor)
+        # 中:QTabWidget(Phase 4b 多 Tab)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: none;
+                background: #fbfaf7;
+            }}
+            QTabBar::tab {{
+                background: #f3eee4;
+                color: {TEXT_SECONDARY};
+                padding: 6px 14px;
+                margin-right: 2px;
+                border: 1px solid {BORDER};
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-size: 11px;
+                min-width: 80px;
+                max-width: 200px;
+            }}
+            QTabBar::tab:selected {{
+                background: #fbfaf7;
+                color: {TEXT};
+                font-weight: 600;
+            }}
+            QTabBar::tab:hover {{
+                background: #fefdfa;
+            }}
+            QTabBar::close-button {{
+                image: none;
+                subcontrol-position: right;
+            }}
+        """)
+        # 信号
+        self.tabs.tabCloseRequested.connect(self._on_close_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        splitter.addWidget(self.tabs)
 
         # 右
-        self.assistant = AssistantPanel(self.editor)
-        splitter.addWidget(self.assistant)
+        # 初始时建 1 个空白 tab
+        self._add_new_tab()
+        first_editor = self._current_editor()
+        self.assistant = AssistantPanel(first_editor) if first_editor else None
+        if self.assistant:
+            splitter.addWidget(self.assistant)
 
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -2449,11 +2511,168 @@ class WriteView(QWidget):
 
         # 信号
         self.file_tree.file_opened.connect(self._on_file_opened)
+        # 恢复上次的 tab 列表
+        self._restore_tabs()
+        # 解除屏蔽(用户操作现在开始持久化)
+        self._suspend_save = False
+
+    # ============================================================
+    # Tab 管理(Phase 4b)
+    # ============================================================
+
+    def _add_new_tab(self, path: Optional[str] = None) -> int:
+        """新建一个 tab(可指定 path),返回 tab index。"""
+        ed = EditorPanel()
+        title = "未命名"
+        if path:
+            try:
+                ed.open_file(path)
+                title = Path(path).name
+            except Exception:
+                pass
+        idx = self.tabs.addTab(ed, title)
+        ed.file_label.setText(title)
+        # Tab 提示
+        if path:
+            self.tabs.setTabToolTip(idx, path)
+        # 默认切到新 tab(避免 addTab 不切的问题)
+        self.tabs.setCurrentIndex(idx)
+        return idx
+
+    def _current_editor(self) -> Optional["EditorPanel"]:
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, EditorPanel) else None
+
+    def _find_tab_by_path(self, path: str) -> int:
+        """查找已打开该 path 的 tab index,没找到返回 -1。"""
+        target = str(Path(path).resolve()).lower()
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, EditorPanel) and w._file_path:
+                if str(Path(w._file_path).resolve()).lower() == target:
+                    return i
+        return -1
+
+    def _on_tab_changed(self, idx: int):
+        """tab 切换:通知 assistant / checkpoint panel。"""
+        ed = self._current_editor()
+        if ed is None:
+            return
+        if hasattr(self, "assistant") and self.assistant:
+            self.assistant.set_editor(ed)
+        # CheckpointPanel(如果它存在并显示)也要切
+        cp = getattr(ed, "_checkpoint_panel", None)
+        if cp and cp.isVisible():
+            cp.set_editor(ed)
+        self._save_tabs()
+
+    def _on_close_tab(self, idx: int):
+        """关闭一个 tab(弹确认 → 移除 → 至少留 1 个空 tab)。"""
+        ed = self.tabs.widget(idx)
+        if not isinstance(ed, EditorPanel):
+            return
+        # 至少留 1 个 tab
+        if self.tabs.count() <= 1:
+            # 是最后一个,清空内容
+            ed.editor.blockSignals(True)
+            ed.editor.setPlainText("")
+            ed.editor.blockSignals(False)
+            ed._file_path = None
+            ed.file_label.setText("未命名文档")
+            self.tabs.setTabText(idx, "未命名")
+            ed._update_word_count()
+            return
+        # 弹确认(虽然有 live save,但关闭 tab 也会让 autosave 失效,这里仅问是否关)
+        path = ed._file_path
+        if path:
+            ret = QMessageBox.question(
+                self, "关闭标签",
+                f"关闭当前标签?\n{Path(path).name}\n\n"
+                "(Live 模式已自动保存,内容不会丢失)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+        # 移除
+        self.tabs.removeTab(idx)
+        ed.deleteLater()
+        # 通知 assistant 切到新 tab
+        new_ed = self._current_editor()
+        if new_ed and self.assistant:
+            self.assistant.set_editor(new_ed)
+        self._save_tabs()
 
     def _on_file_opened(self, path: str):
-        self.editor.open_file(path)
-        self.assistant.set_doc_path(path)
-        self.editor.setFocus()
+        """文件树双击:如果已开,切到该 tab;否则新建。"""
+        idx = self._find_tab_by_path(path)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
+        else:
+            self._add_new_tab(path)
+            self.tabs.setCurrentIndex(self.tabs.count() - 1)
+        ed = self._current_editor()
+        if ed:
+            if self.assistant:
+                self.assistant.set_doc_path(path)
+            ed.setFocus()
+        self._save_tabs()
+
+    # ============================================================
+    # 持久化
+    # ============================================================
+
+    def _save_tabs(self):
+        """把当前打开的文件列表存到 QSettings。"""
+        if getattr(self, "_suspend_save", False):
+            return
+        paths = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, EditorPanel) and w._file_path:
+                paths.append(w._file_path)
+        s = QSettings("WinEBook", self._TABS_KEY)
+        s.setValue("paths", paths)
+        s.setValue("current", self.tabs.currentIndex())
+        s.sync()
+
+    def _restore_tabs(self):
+        """从 QSettings 恢复上次的 tab 列表(找不到的文件静默跳过)。"""
+        s = QSettings("WinEBook", self._TABS_KEY)
+        paths = s.value("paths", [], type=list) or []
+        current = int(s.value("current", 0))
+        # 至少留 1 个 tab
+        if not paths:
+            return
+        # 依次打开
+        opened = 0
+        for p in paths:
+            if not p or not Path(p).exists():
+                continue
+            self._add_new_tab(str(p))
+            opened += 1
+        # 切到上次 current(钳到有效范围)
+        if opened > 0 and 0 <= current < self.tabs.count():
+            self.tabs.setCurrentIndex(current)
+        self._save_tabs()
+
+    # ============================================================
+    # 兼容旧 API
+    # ============================================================
+
+    @property
+    def editor(self) -> Optional["EditorPanel"]:
+        """向后兼容:返回当前 tab 的 editor。"""
+        return self._current_editor()
 
     def shutdown(self):
-        self.assistant.shutdown()
+        # 关闭所有 editor 关联的后台线程
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, EditorPanel):
+                try:
+                    # 调一次 _auto_save 确保落盘
+                    w._auto_save()
+                except Exception:
+                    pass
+        if self.assistant:
+            self.assistant.shutdown()
