@@ -454,9 +454,17 @@ class EditorPanel(QFrame):
         self.btn_history.toggled.connect(self._on_history_toggled)
         tb.addWidget(self.btn_history)
 
+        # 实时预览(Phase 3c)
+        self.btn_preview = QToolButton()
+        self.btn_preview.setText("📄 预览")
+        self.btn_preview.setCheckable(True)
+        self.btn_preview.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_preview.toggled.connect(self._on_preview_toggled)
+        tb.addWidget(self.btn_preview)
+
         layout.addWidget(toolbar)
 
-        # ---------- 编辑器 ----------
+        # ---------- 编辑器 + 预览(splitter) ----------
         self.editor = QPlainTextEdit()
         # 排版预设:从 QSettings 读取(Phase 3a)
         cs_t = QSettings("WinEBook", "EditorTypography")
@@ -469,7 +477,45 @@ class EditorPanel(QFrame):
         for n, a in self._preset_actions.items():
             a.setChecked(n == self._current_preset)
         self.editor.textChanged.connect(self._on_text_changed)
-        layout.addWidget(self.editor, 1)
+
+        # 预览面板(Phase 3c):QTextBrowser
+        from PySide6.QtWidgets import QTextBrowser
+        self.preview_browser = QTextBrowser()
+        self.preview_browser.setOpenExternalLinks(False)  # 不让外部链接直接打开
+        self.preview_browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background: #ffffff;
+                border-left: 1px solid {BORDER};
+                border: none;
+                padding: 20px 32px;
+            }}
+        """)
+        self.preview_browser.hide()  # 默认隐藏
+
+        # Splitter(默认只装 editor)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.editor)
+        self.splitter.addWidget(self.preview_browser)
+        self.splitter.setStretchFactor(0, 3)  # editor 占 3/4
+        self.splitter.setStretchFactor(1, 1)  # preview 占 1/4
+        self.splitter.setSizes([600, 200])
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        # 读 QSettings:上次预览状态
+        cs_p = QSettings("WinEBook", "PreviewPanel")
+        self._preview_enabled: bool = cs_p.value("enabled", False, type=bool)
+        layout.addWidget(self.splitter, 1)
+
+        # 预览 debounce timer
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._render_preview)
+
+        # 同步 toolbar 状态
+        self.btn_preview.setChecked(self._preview_enabled)
+        if self._preview_enabled:
+            self.preview_browser.show()
+            self._render_preview()
 
         # Live 模式下的 Markdown 高亮
         self._highlighter = MarkdownHighlighter(self.editor.document())
@@ -576,6 +622,12 @@ class EditorPanel(QFrame):
         self.editor.blockSignals(False)
         self._update_word_count()
         self.save_label.setText("已加载")
+        # 加载完立即渲染一次预览
+        if hasattr(self, "_preview_enabled") and self._preview_enabled:
+            self._render_preview()
+        # 加载完更新 checkpoint 状态
+        if hasattr(self, "_update_checkpoint_label"):
+            self._update_checkpoint_label()
 
     def selected_text(self) -> str:
         return self.editor.textCursor().selectedText()
@@ -594,6 +646,10 @@ class EditorPanel(QFrame):
         self._update_word_count()
         if self._live_mode and self._file_path and self.live_toggle.isChecked():
             self._save_label_delayed()
+        # 预览面板(Phase 3c):开启时 300ms debounce 渲染
+        if hasattr(self, "_preview_enabled") and self._preview_enabled:
+            if hasattr(self, "_preview_timer"):
+                self._preview_timer.start(300)
         # 触发在线补全(短 + 长)
         if self._completion_enabled and self.live_toggle.isChecked():
             self._hide_ghost()
@@ -1225,6 +1281,30 @@ class EditorPanel(QFrame):
         else:
             if self._checkpoint_panel:
                 self._checkpoint_panel.hide()
+
+    def _on_preview_toggled(self, checked: bool):
+        """显示 / 隐藏 Markdown 实时预览(Phase 3c)。"""
+        self._preview_enabled = checked
+        if checked:
+            self.preview_browser.show()
+            self._render_preview()
+        else:
+            self.preview_browser.hide()
+        # 持久化
+        cs_p = QSettings("WinEBook", "PreviewPanel")
+        cs_p.setValue("enabled", checked)
+
+    def _render_preview(self):
+        """把 editor 当前内容渲染到 QTextBrowser(带 GFM CSS)。"""
+        from src.core.markdown_render import render_full_html
+        text = self.editor.toPlainText()
+        try:
+            title = self.file_label.text() or "预览"
+            html = render_full_html(text, title=title)
+            self.preview_browser.setHtml(html)
+        except Exception:  # noqa: BLE001
+            # 渲染失败至少不崩
+            pass
 
     def _on_export(self):
         if not self._file_path:

@@ -12,7 +12,7 @@ env/
 ENV/
 
 # ---------- 打包产物 ----------
-# 注意:dist/ 故意保留,exe 一起推到仓库里方便用户直接用
+# 注意:dist/WinEBook.exe 仍通过 `git add -f` 偶尔追踪,方便单文件分发
 build/
 *.spec.bak
 
