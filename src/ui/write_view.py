@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QLineEdit, QTextEdit,
     QPlainTextEdit, QTreeView, QFileSystemModel, QPushButton, QFileDialog,
     QMessageBox, QSizePolicy, QSplitter, QToolButton, QApplication, QComboBox,
-    QScrollArea, QMenu,
+    QScrollArea, QMenu, QListWidget, QListWidgetItem, QLineEdit,
 )
 
 from src.core.llm import (
@@ -446,6 +446,14 @@ class EditorPanel(QFrame):
         self.btn_export.clicked.connect(self._on_export)
         tb.addWidget(self.btn_export)
 
+        # Checkpoint 历史(Phase 3b)
+        self.btn_history = QToolButton()
+        self.btn_history.setText("⏱ 历史")
+        self.btn_history.setCheckable(True)
+        self.btn_history.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_history.toggled.connect(self._on_history_toggled)
+        tb.addWidget(self.btn_history)
+
         layout.addWidget(toolbar)
 
         # ---------- 编辑器 ----------
@@ -528,13 +536,27 @@ class EditorPanel(QFrame):
                 background: transparent;
             }}
         """)
+        # Checkpoint 状态(Phase 3b)
+        self.checkpoint_label = QLabel("")
+        self.checkpoint_label.setStyleSheet(f"""
+            QLabel {{
+                color: {TEXT_SECONDARY};
+                font-size: 10px;
+                background: transparent;
+                padding-right: 8px;
+            }}
+        """)
         sb.addStretch(1)
+        sb.addWidget(self.checkpoint_label)
         sb.addWidget(self.save_label)
 
         layout.addWidget(statusbar)
 
         # 初始化内联 Agent 编辑
         self._setup_inline_agent()
+
+        # Checkpoint 面板(浮层,默认隐藏)
+        self._checkpoint_panel: Optional["CheckpointPanel"] = None
 
     # ---------- 操作 ----------
     def open_file(self, path: str):
@@ -609,8 +631,67 @@ class EditorPanel(QFrame):
                 self.editor.toPlainText(), encoding="utf-8")
             ts = time.strftime("%H:%M:%S")
             self.save_label.setText(f"已保存 {ts}")
+            # Checkpoint(Phase 3b):根据触发策略自动 snapshot
+            self._maybe_create_checkpoint()
         except Exception as e:  # noqa: BLE001
             self.save_label.setText(f"保存失败: {e}")
+
+    def _maybe_create_checkpoint(self, trigger: str = "auto-chars", note: str = ""):
+        """根据策略创建一条 checkpoint,自动更新状态栏。"""
+        if not self._file_path:
+            return
+        try:
+            from src.core.checkpoint import (
+                create_checkpoint, default_checkpoint_root,
+                should_create_checkpoint, last_checkpoint,
+            )
+            content = self.editor.toPlainText()
+            root = default_checkpoint_root()
+            # 手动保存 / 还原后 → 总是创建(跳过触发判断)
+            if trigger in ("manual", "auto-pre-restore"):
+                cp = create_checkpoint(
+                    self._file_path, content, trigger=trigger,
+                    note=note, root=root)
+            else:
+                # 自动:先判断是否到阈值
+                if not should_create_checkpoint(self._file_path, root=root):
+                    return
+                cp = create_checkpoint(
+                    self._file_path, content, trigger=trigger,
+                    note=note, root=root)
+            if cp is None:
+                return  # 去重跳过
+            self._update_checkpoint_label()
+            # 通知 checkpoint panel 刷新
+            if hasattr(self, "_checkpoint_panel") and self._checkpoint_panel:
+                self._checkpoint_panel.refresh()
+        except Exception as e:  # noqa: BLE001
+            # checkpoint 失败不影响主保存
+            pass
+
+    def _update_checkpoint_label(self):
+        """状态栏:显示最近 checkpoint 时间。"""
+        if not self._file_path:
+            self.checkpoint_label.setText("")
+            return
+        try:
+            from src.core.checkpoint import last_checkpoint, default_checkpoint_root
+            cp = last_checkpoint(self._file_path, root=default_checkpoint_root())
+            if cp is None:
+                self.checkpoint_label.setText("⏱ 尚无快照")
+            else:
+                ago = int(time.time()) - cp.ts
+                if ago < 60:
+                    ago_str = f"{ago}秒前"
+                elif ago < 3600:
+                    ago_str = f"{ago // 60}分钟前"
+                elif ago < 86400:
+                    ago_str = f"{ago // 3600}小时前"
+                else:
+                    ago_str = f"{ago // 86400}天前"
+                self.checkpoint_label.setText(f"⏱ 上次快照 {ago_str} · {cp.short_hash()}")
+        except Exception:
+            self.checkpoint_label.setText("⏱ 快照:—")
 
     def _change_font(self, delta: int):
         """在当前 preset 基础上 ±1 字号,持久化偏移。"""
@@ -1127,6 +1208,23 @@ class EditorPanel(QFrame):
 
     def _on_readonly_toggled(self, checked: bool):
         self.editor.setReadOnly(checked)
+
+    def _on_history_toggled(self, checked: bool):
+        """显示 / 隐藏 CheckpointPanel(Phase 3b)。"""
+        if checked:
+            if self._checkpoint_panel is None:
+                self._checkpoint_panel = CheckpointPanel(self)
+                # 浮在 editor 顶部
+                self._checkpoint_panel.move(
+                    (self.width() - 480) // 2,
+                    60,
+                )
+            self._checkpoint_panel.refresh()
+            self._checkpoint_panel.show()
+            self._checkpoint_panel.raise_()
+        else:
+            if self._checkpoint_panel:
+                self._checkpoint_panel.hide()
 
     def _on_export(self):
         if not self._file_path:
@@ -1895,6 +1993,330 @@ _TOOLBTN_QSS = f"""
         border: 1px solid {ACCENT};
     }}
 """
+
+
+# ============================================================
+# Checkpoint 面板(Phase 3b)
+# ============================================================
+
+class CheckpointPanel(QFrame):
+    """浮层,显示当前文档的所有 checkpoint 列表 + 操作。"""
+
+    def __init__(self, editor: "EditorPanel", parent=None):
+        super().__init__(parent)
+        self._editor = editor
+        self.setFixedSize(480, 460)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: #ffffff;
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS}px;
+            }}
+        """)
+        # 阴影
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        from PySide6.QtGui import QColor
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        self.setGraphicsEffect(shadow)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.setSpacing(8)
+
+        # 标题
+        title = QLabel("⏱ 文档历史快照")
+        title.setStyleSheet(f"""
+            QLabel {{
+                color: {TEXT};
+                font-family: {FONT_HEADING};
+                font-size: 14px;
+                font-weight: 700;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        v.addWidget(title)
+
+        hint = QLabel("每 5 分钟或累积 200 字符自动保存。手动保存可加备注。")
+        hint.setStyleSheet(f"""
+            QLabel {{
+                color: {TEXT_MUTED};
+                font-size: 10px;
+                background: transparent;
+                border: none;
+            }}
+        """)
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        # 列表
+        self.list = QListWidget()
+        self.list.setStyleSheet(f"""
+            QListWidget {{
+                background: #fbfaf7;
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS_SM}px;
+                font-size: 11px;
+                padding: 4px;
+            }}
+            QListWidget::item {{
+                padding: 6px 8px;
+                border-bottom: 1px solid #f0ece2;
+            }}
+            QListWidget::item:selected {{
+                background: {ACCENT_SUBTLE};
+                color: {TEXT};
+            }}
+        """)
+        self.list.itemDoubleClicked.connect(self._on_preview)
+        v.addWidget(self.list, 1)
+
+        # 操作按钮
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.btn_preview = self._make_btn("👁 预览", self._on_preview)
+        self.btn_restore = self._make_btn("↩ 还原", self._on_restore, primary=True)
+        self.btn_delete = self._make_btn("🗑 删除", self._on_delete)
+        btn_row.addWidget(self.btn_preview)
+        btn_row.addWidget(self.btn_restore)
+        btn_row.addWidget(self.btn_delete)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+
+        # 手动保存区
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet(f"color: {BORDER}; background: {BORDER};")
+        sep.setFixedHeight(1)
+        v.addWidget(sep)
+
+        manual_row = QHBoxLayout()
+        manual_row.setSpacing(6)
+        self.note_input = QLineEdit()
+        self.note_input.setPlaceholderText("备注(可选)…")
+        self.note_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: #fbfaf7;
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS_XS}px;
+                padding: 5px 8px;
+                font-size: 11px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {BORDER_FOCUS};
+            }}
+        """)
+        self.note_input.returnPressed.connect(self._on_manual_save)
+        manual_row.addWidget(self.note_input, 1)
+        self.btn_manual = self._make_btn("📌 手动保存", self._on_manual_save, primary=True)
+        manual_row.addWidget(self.btn_manual)
+        v.addLayout(manual_row)
+
+        # 关闭按钮(右上)
+        self.btn_close = QToolButton(self)
+        self.btn_close.setText("×")
+        self.btn_close.setFixedSize(24, 24)
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: none;
+                font-size: 18px;
+                font-weight: 700;
+            }}
+            QToolButton:hover {{
+                color: {DANGER if 'DANGER' in dir() else '#ef4444'};
+            }}
+        """)
+        self.btn_close.move(self.width() - 32, 6)
+        self.btn_close.clicked.connect(self._on_close)
+
+    def _make_btn(self, text, slot, primary=False):
+        from src.ui.theme import DANGER
+        btn = QToolButton()
+        btn.setText(text)
+        btn.setCursor(Qt.PointingHandCursor)
+        if primary:
+            btn.setStyleSheet(f"""
+                QToolButton {{
+                    background: {ACCENT};
+                    color: #ffffff;
+                    border: 1px solid {ACCENT};
+                    border-radius: {RADIUS_XS}px;
+                    padding: 4px 10px;
+                    font-size: 11px;
+                }}
+                QToolButton:hover {{
+                    background: {ACCENT_HOVER};
+                    border: 1px solid {ACCENT_HOVER};
+                }}
+            """)
+        else:
+            btn.setStyleSheet(_TOOLBTN_QSS)
+        btn.clicked.connect(slot)
+        return btn
+
+    def _on_close(self):
+        if self._editor and self._editor.btn_history.isChecked():
+            self._editor.btn_history.setChecked(False)
+
+    def refresh(self):
+        """从 checkpoint 引擎读最新列表,刷新 UI。"""
+        self.list.clear()
+        fp = self._editor._file_path if self._editor else None
+        if not fp:
+            placeholder = QListWidgetItem("未打开文档")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.list.addItem(placeholder)
+            return
+        try:
+            from src.core.checkpoint import list_checkpoints, default_checkpoint_root
+            cps = list_checkpoints(fp, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            err = QListWidgetItem(f"读取失败: {e}")
+            err.setFlags(Qt.NoItemFlags)
+            self.list.addItem(err)
+            return
+        if not cps:
+            empty = QListWidgetItem("暂无快照 · 编辑几分钟后会自动出现")
+            empty.setFlags(Qt.NoItemFlags)
+            self.list.addItem(empty)
+            return
+        # 倒序显示(最新在最上面)
+        for cp in reversed(cps):
+            trigger_label = {
+                "manual": "📌 手动",
+                "auto-chars": "✍ 自动(字符)",
+                "auto-time": "⏰ 自动(时间)",
+                "auto-pre-restore": "↩ 还原前",
+            }.get(cp.trigger, cp.trigger)
+            note = f" · {cp.note}" if cp.note else ""
+            label = (
+                f"{cp.display_time()}  ·  {cp.char_count}字  "
+                f"({cp.char_delta:+d})  ·  {trigger_label}{note}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, cp.ts)
+            self.list.addItem(item)
+
+    def _selected_ts(self) -> Optional[int]:
+        item = self.list.currentItem()
+        if not item:
+            return None
+        ts = item.data(Qt.UserRole)
+        return int(ts) if ts is not None else None
+
+    def _on_preview(self, *_):
+        ts = self._selected_ts()
+        if ts is None:
+            return
+        fp = self._editor._file_path
+        try:
+            from src.core.checkpoint import load_checkpoint_content, default_checkpoint_root
+            content = load_checkpoint_content(fp, ts, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "预览失败", str(e))
+            return
+        if content is None:
+            QMessageBox.warning(self, "预览失败", "快照内容丢失(可能被清理)")
+            return
+        # 简单弹窗预览(前 2000 字)
+        preview = content[:2000] + ("\n\n… (已截断)" if len(content) > 2000 else "")
+        QMessageBox.information(
+            self, f"快照预览 · {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))}",
+            preview,
+        )
+
+    def _on_restore(self):
+        ts = self._selected_ts()
+        if ts is None:
+            return
+        fp = self._editor._file_path
+        if not fp:
+            return
+        # 二次确认
+        ret = QMessageBox.question(
+            self, "还原快照",
+            f"将把文档还原到 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))} 的状态。\n"
+            "当前内容会自动保存为新快照(可找回)。\n\n确认还原?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            from src.core.checkpoint import restore_checkpoint, default_checkpoint_root
+            ok = restore_checkpoint(fp, ts, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "还原失败", str(e))
+            return
+        if not ok:
+            QMessageBox.warning(self, "还原失败", "找不到该快照")
+            return
+        # 重新加载到 editor
+        try:
+            text = Path(fp).read_text(encoding="utf-8")
+            self._editor.editor.blockSignals(True)
+            self._editor.editor.setPlainText(text)
+            self._editor.editor.blockSignals(False)
+            self._editor._update_word_count()
+            self._editor._update_checkpoint_label()
+            self.refresh()
+            QMessageBox.information(self, "已还原", "文档已还原到所选快照。\n旧内容已自动备份。")
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "刷新失败", str(e))
+
+    def _on_delete(self):
+        ts = self._selected_ts()
+        if ts is None:
+            return
+        ret = QMessageBox.question(
+            self, "删除快照",
+            f"确认删除 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))} 的快照?\n"
+            "(不会影响当前文档)",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        fp = self._editor._file_path
+        try:
+            from src.core.checkpoint import delete_checkpoint, default_checkpoint_root
+            ok = delete_checkpoint(fp, ts, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "删除失败", str(e))
+            return
+        if ok:
+            self._editor._update_checkpoint_label()
+            self.refresh()
+        else:
+            QMessageBox.warning(self, "删除失败", "找不到该快照")
+
+    def _on_manual_save(self):
+        fp = self._editor._file_path
+        if not fp:
+            QMessageBox.information(self, "提示", "请先打开或新建一个文档")
+            return
+        note = self.note_input.text().strip()
+        self.note_input.clear()
+        # 复用 editor 的 _maybe_create_checkpoint
+        self._editor._maybe_create_checkpoint(trigger="manual", note=note)
+        self.refresh()
+
+    def moveEvent(self, ev):
+        super().moveEvent(ev)
+        # 关闭按钮跟随移动
+        if hasattr(self, "btn_close"):
+            self.btn_close.move(self.width() - 32, 6)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if hasattr(self, "btn_close"):
+            self.btn_close.move(self.width() - 32, 6)
 
 
 class WriteView(QWidget):
