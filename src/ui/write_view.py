@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QLineEdit, QTextEdit,
     QPlainTextEdit, QTreeView, QFileSystemModel, QPushButton, QFileDialog,
     QMessageBox, QSizePolicy, QSplitter, QToolButton, QApplication, QComboBox,
-    QScrollArea,
+    QScrollArea, QMenu,
 )
 
 from src.core.llm import (
@@ -49,6 +49,67 @@ def default_workspace() -> Path:
     if not p.exists():
         p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ============================================================
+# 排版字体预设(Phase 3a)
+# ============================================================
+
+# 4 套排版预设:字体族 / 基准字号 / 行距 / 段距 / 边距 / 配色
+# 用户通过工具栏"排版"下拉切换,持久化到 QSettings。
+TYPOGRAPHY_PRESETS: dict[str, dict] = {
+    "护眼": {
+        "font_family": "Georgia, 'Source Han Serif SC', 'Microsoft YaHei', serif",
+        "base_size": 14,
+        "line_height": 1.65,
+        "para_margin": 8,
+        "padding_v": 16,
+        "padding_h": 28,
+        "background": "#fbfaf7",
+        "color": "#1f2937",
+    },
+    "紧凑": {
+        "font_family": "'Consolas', 'Cascadia Code', 'Microsoft YaHei', 'Courier New', monospace",
+        "base_size": 12,
+        "line_height": 1.45,
+        "para_margin": 4,
+        "padding_v": 10,
+        "padding_h": 20,
+        "background": "#fefdfa",
+        "color": "#1f2937",
+    },
+    "学术": {
+        "font_family": "'Times New Roman', 'SimSun', 'Noto Serif SC', serif",
+        "base_size": 13,
+        "line_height": 1.75,
+        "para_margin": 12,
+        "padding_v": 24,
+        "padding_h": 40,
+        "background": "#ffffff",
+        "color": "#1a1a1a",
+    },
+    "手稿": {
+        "font_family": "'Caveat', 'KaiTi', 'STKaiti', 'Microsoft YaHei', cursive",
+        "base_size": 16,
+        "line_height": 1.9,
+        "para_margin": 16,
+        "padding_v": 32,
+        "padding_h": 52,
+        "background": "#fdf8ef",
+        "color": "#3a2e1f",
+    },
+}
+
+
+def _default_preset_name() -> str:
+    return "护眼"
+
+
+def _font_size_range(preset_name: str) -> tuple[int, int]:
+    """在当前 preset 基准上允许 ±6 浮动。"""
+    p = TYPOGRAPHY_PRESETS.get(preset_name, TYPOGRAPHY_PRESETS[_default_preset_name()])
+    base = p["base_size"]
+    return max(9, base - 6), base + 8  # 9 ~ base+8, 留出上调空间
 
 
 # ============================================================
@@ -296,6 +357,24 @@ class EditorPanel(QFrame):
         self.live_toggle.toggled.connect(self._on_live_toggled)
         tb.addWidget(self.live_toggle)
 
+        # 排版预设下拉(Phase 3a)
+        self.preset_btn = QToolButton()
+        self.preset_btn.setText("排版")
+        self.preset_btn.setCursor(Qt.PointingHandCursor)
+        self.preset_btn.setStyleSheet(_TOOLBTN_QSS)
+        self.preset_btn.setPopupMode(QToolButton.InstantPopup)
+        preset_menu = QMenu(self.preset_btn)
+        # 4 套预设 → 单选菜单项
+        self._preset_actions: dict[str, QAction] = {}
+        for name in TYPOGRAPHY_PRESETS:
+            act = QAction(name, preset_menu)
+            act.setCheckable(True)
+            act.triggered.connect(lambda _checked=False, n=name: self._apply_preset(n))
+            preset_menu.addAction(act)
+            self._preset_actions[name] = act
+        self.preset_btn.setMenu(preset_menu)
+        tb.addWidget(self.preset_btn)
+
         # 字号
         self.font_minus = QToolButton()
         self.font_minus.setText("−")
@@ -371,18 +450,16 @@ class EditorPanel(QFrame):
 
         # ---------- 编辑器 ----------
         self.editor = QPlainTextEdit()
-        self.editor.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background: #fbfaf7;
-                color: #1f2937;
-                font-family: 'Georgia', 'Source Han Serif SC', 'Microsoft YaHei', serif;
-                font-size: 14px;
-                border: none;
-                padding: 16px 28px;
-                line-height: 1.65;
-                selection-background-color: rgba(200, 148, 110, 0.25);
-            }}
-        """)
+        # 排版预设:从 QSettings 读取(Phase 3a)
+        cs_t = QSettings("WinEBook", "EditorTypography")
+        self._current_preset: str = cs_t.value("preset", _default_preset_name(), type=str)
+        if self._current_preset not in TYPOGRAPHY_PRESETS:
+            self._current_preset = _default_preset_name()
+        self._size_offset: int = cs_t.value("size_offset", 0, type=int)  # 在 preset 基础上的微调
+        self._apply_preset(self._current_preset, _save=False)
+        # 同步 preset 菜单的 checked 状态
+        for n, a in self._preset_actions.items():
+            a.setChecked(n == self._current_preset)
         self.editor.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.editor, 1)
 
@@ -416,7 +493,6 @@ class EditorPanel(QFrame):
         self._completion_worker: Optional[_LLMWorker] = None
         self._completion_mode: str = ""  # "short" / "long"
         # 默认 debounce
-        from PySide6.QtCore import QSettings
         cs = QSettings("WinEBook", "InlineCompletion")
         self._completion_enabled: bool = cs.value("enabled", True, type=bool)
         self._short_debounce_ms: int = cs.value("short_debounce_ms", 800, type=int)
@@ -537,12 +613,60 @@ class EditorPanel(QFrame):
             self.save_label.setText(f"保存失败: {e}")
 
     def _change_font(self, delta: int):
+        """在当前 preset 基础上 ±1 字号,持久化偏移。"""
+        preset = TYPOGRAPHY_PRESETS.get(
+            self._current_preset, TYPOGRAPHY_PRESETS[_default_preset_name()])
+        lo, hi = _font_size_range(self._current_preset)
+        new_offset = max(-6, min(8, self._size_offset + delta))
+        new_size = max(lo, min(hi, preset["base_size"] + new_offset))
+        # 算出实际达到的 offset(可能被 range 截断)
+        actual_offset = new_size - preset["base_size"]
+        if actual_offset == self._size_offset:
+            return
+        self._size_offset = actual_offset
+        cs_t = QSettings("WinEBook", "EditorTypography")
+        cs_t.setValue("size_offset", self._size_offset)
         font = self.editor.font()
-        cur = font.pointSize() or 14
-        new_size = max(10, min(28, cur + delta))
         font.setPointSize(new_size)
         self.editor.setFont(font)
         self.font_label.setText(str(new_size))
+
+    def _apply_preset(self, name: str, _save: bool = True):
+        """应用一套排版预设:字体族 / 字号 / 行距 / 段距 / 边距 / 配色。"""
+        if name not in TYPOGRAPHY_PRESETS:
+            return
+        self._current_preset = name
+        p = TYPOGRAPHY_PRESETS[name]
+        # 1. 字体 + 字号
+        font = QFont()
+        font.setStyleHint(QFont.Serif if "serif" in p["font_family"].lower() else QFont.AnyStyle)
+        font.setPointSize(p["base_size"] + self._size_offset)
+        self.editor.setFont(font)
+        self.font_label.setText(str(p["base_size"] + self._size_offset))
+        # 2. 编辑器整体样式(背景/颜色/字体族/边距)
+        self.editor.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background: {p["background"]};
+                color: {p["color"]};
+                font-family: {p["font_family"]};
+                border: none;
+                padding: {p["padding_v"]}px {p["padding_h"]}px;
+                selection-background-color: rgba(200, 148, 110, 0.25);
+            }}
+        """)
+        # 3. 段落级样式:行距 + 段距(通过 document 的 defaultStyleSheet)
+        #    Qt 的 QPlainTextEdit 支持 line-height / margin CSS
+        self.editor.document().setDefaultStyleSheet(
+            f"p {{ line-height: {p['line_height']}; margin: 0 0 {p['para_margin']}px 0; }}"
+        )
+        # 4. 同步菜单的 checked
+        for n, a in self._preset_actions.items():
+            a.setChecked(n == name)
+        # 5. 持久化
+        if _save:
+            cs_t = QSettings("WinEBook", "EditorTypography")
+            cs_t.setValue("preset", name)
+            cs_t.setValue("size_offset", self._size_offset)
 
     def _on_live_toggled(self, checked: bool):
         """Live 模式:开关 Markdown 实时高亮 + 在线补全。"""
