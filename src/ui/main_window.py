@@ -15,15 +15,17 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QFont, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QStatusBar, QMessageBox, QLabel, QWidget, QToolButton,
-    QVBoxLayout, QHBoxLayout, QLineEdit, QFrame, QStackedWidget,
+    QVBoxLayout, QHBoxLayout, QLineEdit, QFrame, QStackedWidget, QFileDialog,
 )
 
 from src.core import Library, BookRecord, Book
+from src.core import pdf_reader as pdf_reader_core
 from src.ui.library_view import LibraryList
 from src.ui.reader_view import ReaderView
 from src.ui.online_view import OnlineView
 from src.ui.home_view import HomeView
 from src.ui.write_view import WriteView
+from src.ui.pdf_reader_view import PdfReaderView
 from src.ui.theme import THEME_QSS, FONT_HEADING, ACCENT, TEXT_SECONDARY, SURFACE, BORDER
 
 
@@ -124,6 +126,7 @@ class MainWindow(QMainWindow):
     PAGE_READER  = 2  # 阅读详情页
     PAGE_ONLINE  = 3  # 在线书库
     PAGE_WRITE   = 4  # 墨写
+    PAGE_PDF     = 5  # PDF 阅读(Phase 3d)
 
     def __init__(self, library: Library):
         super().__init__()
@@ -153,6 +156,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_reader_page())  # 2
         self.stack.addWidget(self._build_online_page())  # 3
         self.stack.addWidget(self._build_write_page())   # 4
+        self.stack.addWidget(self._build_pdf_page())     # 5
         central_layout.addWidget(self.stack, 1)
 
         self.setCentralWidget(central)
@@ -190,6 +194,12 @@ class MainWindow(QMainWindow):
         """墨写页(三栏:文件树/编辑器/AI 助手)。"""
         self.write_view = WriteView()
         return self.write_view
+
+    def _build_pdf_page(self) -> QWidget:
+        """PDF 阅读页(Phase 3d)。"""
+        self.pdf_view = PdfReaderView()
+        self.pdf_view.back_requested.connect(self._back_from_pdf)
+        return self.pdf_view
 
     def _build_library_page(self) -> QWidget:
         """主页:书库网格。"""
@@ -267,6 +277,16 @@ class MainWindow(QMainWindow):
         act_import.setShortcut("Ctrl+O")
         act_import.triggered.connect(self._import_via_shortcut)
         file_menu.addAction(act_import)
+
+        # 打开 PDF(Phase 3d)
+        act_pdf = QAction("打开 PDF(&P)", self)
+        act_pdf.setShortcut("Ctrl+Shift+O")
+        act_pdf.triggered.connect(self._open_pdf_dialog)
+        act_pdf.setEnabled(pdf_reader_core.is_available())
+        file_menu.addAction(act_pdf)
+        if not pdf_reader_core.is_available():
+            act_pdf.setToolTip("需要安装 PyMuPDF: pip install pymupdf")
+
         file_menu.addSeparator()
         act_quit = QAction("退出(&Q)", self)
         act_quit.setShortcut("Ctrl+Q")
@@ -333,6 +353,36 @@ class MainWindow(QMainWindow):
         self.status_label.setText("在线书库(联网请选择来源 + 搜索关键字)")
         self._update_topbar_for_page()
 
+    def _open_pdf_dialog(self):
+        """弹文件选择框,打开一个 PDF(Phase 3d)。"""
+        if not pdf_reader_core.is_available():
+            QMessageBox.warning(
+                self, "未安装 PyMuPDF",
+                "PDF 阅读功能需要 PyMuPDF。\n请在终端运行:\n\n"
+                "pip install pymupdf\n\n然后重启应用。",
+            )
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开 PDF", "",
+            "PDF Files (*.pdf);;All Files (*.*)",
+        )
+        if not path:
+            return
+        ok = self.pdf_view.open_pdf(path)
+        if ok:
+            self.stack.setCurrentIndex(self.PAGE_PDF)
+            self.status_label.setText(
+                f"PDF 阅读  ·  {os.path.basename(path)}  ·  "
+                f"{self.pdf_view._doc.page_count} 页"
+            )
+            self._update_topbar_for_page()
+
+    def _back_from_pdf(self):
+        """从 PDF 返回主页(关闭 doc,切回 library)。"""
+        self.status_label.setText("就绪")
+        self.stack.setCurrentIndex(self.PAGE_LIBRARY)
+        self._update_topbar_for_page()
+
     def _update_topbar_for_page(self):
         """根据当前页更新顶栏:在首页时隐藏"返回首页"按钮,其他页显示。"""
         if self.stack.currentIndex() == self.PAGE_HOME:
@@ -387,8 +437,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, "关于 墨读",
             "墨读 · WinEBook  本地电子书阅读器\n\n"
-            "格式:txt / epub\n"
-            "功能:章节解析、阅读进度记忆、历史回看\n"
+            "格式:txt / epub / pdf\n"
+            "功能:章节解析、阅读进度记忆、历史回看、PDF 阅读\n"
             "在线:搜索/目录/在线阅读/批量下载(笔趣阁类源)\n"
             "数据:本地 SQLite"
         )
@@ -402,6 +452,12 @@ class MainWindow(QMainWindow):
             # 关闭墨写后台 LLM 线程
             if hasattr(self, "write_view"):
                 self.write_view.shutdown()
+        except Exception:
+            pass
+        try:
+            # 关闭 PDF 阅读(Phase 3d)
+            if hasattr(self, "pdf_view"):
+                self.pdf_view.shutdown()
         except Exception:
             pass
         try:
