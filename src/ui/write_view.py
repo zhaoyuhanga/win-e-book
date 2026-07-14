@@ -32,8 +32,8 @@ from src.core.write_agent import (
 )
 from src.ui.theme import (
     BG, SURFACE, SURFACE_RAISED, BORDER, BORDER_FOCUS, ACCENT, ACCENT_HOVER,
-    TEXT, TEXT_SECONDARY, TEXT_MUTED, FONT_HEADING, FONT_BODY, RADIUS, RADIUS_SM,
-    SUCCESS, DANGER, TAG_BG,
+    ACCENT_SUBTLE, TEXT, TEXT_SECONDARY, TEXT_MUTED, FONT_HEADING, FONT_BODY,
+    RADIUS, RADIUS_SM, RADIUS_XS, SUCCESS, DANGER, TAG_BG,
 )
 from src.ui.markdown_highlighter import MarkdownHighlighter
 
@@ -160,22 +160,22 @@ class FileTreePanel(QFrame):
                 border-right: 1px solid {BORDER};
             }}
         """)
-        self.setMinimumWidth(180)
-        self.setMaximumWidth(240)
+        self.setMinimumWidth(200)
+        self.setMaximumWidth(280)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 14, 12, 10)
+        layout.setSpacing(8)
 
         # 顶部:工作区名 + 新建/刷新按钮
         head = QHBoxLayout()
         head.setSpacing(4)
-        self.title = QLabel(root.name)
+        self.title = QLabel(f"📁 {root.name}")
         self.title.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT};
                 font-family: {FONT_HEADING};
-                font-size: 12px;
+                font-size: 13px;
                 font-weight: 700;
                 background: transparent;
                 border: none;
@@ -187,8 +187,22 @@ class FileTreePanel(QFrame):
         self.btn_new.setText("+")
         self.btn_new.setToolTip("新建文件")
         self.btn_new.setCursor(Qt.PointingHandCursor)
-        self.btn_new.setFixedSize(22, 22)
-        self.btn_new.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_new.setFixedSize(26, 26)
+        self.btn_new.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: 1px solid transparent;
+                border-radius: {RADIUS_XS}px;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            QToolButton:hover {{
+                color: {ACCENT};
+                background: {SURFACE_RAISED};
+                border: 1px solid {BORDER};
+            }}
+        """)
         self.btn_new.clicked.connect(self._on_new_file)
         head.addWidget(self.btn_new)
 
@@ -196,8 +210,21 @@ class FileTreePanel(QFrame):
         self.btn_refresh.setText("⟳")
         self.btn_refresh.setToolTip("刷新")
         self.btn_refresh.setCursor(Qt.PointingHandCursor)
-        self.btn_refresh.setFixedSize(22, 22)
-        self.btn_refresh.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_refresh.setFixedSize(26, 26)
+        self.btn_refresh.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: 1px solid transparent;
+                border-radius: {RADIUS_XS}px;
+                font-size: 14px;
+            }}
+            QToolButton:hover {{
+                color: {ACCENT};
+                background: {SURFACE_RAISED};
+                border: 1px solid {BORDER};
+            }}
+        """)
         self.btn_refresh.clicked.connect(self._refresh)
         head.addWidget(self.btn_refresh)
 
@@ -218,25 +245,27 @@ class FileTreePanel(QFrame):
         for col in (1, 2, 3):
             self.tree.hideColumn(col)
         self.tree.setAnimated(True)
-        self.tree.setIndentation(14)
+        self.tree.setIndentation(16)
         self.tree.setStyleSheet(f"""
             QTreeView {{
                 background: transparent;
                 color: {TEXT_SECONDARY};
                 border: none;
                 outline: 0;
-                font-size: 12px;
+                font-size: 12.5px;
+                font-family: {FONT_BODY};
             }}
             QTreeView::item {{
-                padding: 3px 6px;
+                padding: 5px 8px;
                 border-radius: 4px;
+                min-height: 22px;
             }}
             QTreeView::item:hover {{
                 background: {SURFACE_RAISED};
                 color: {TEXT};
             }}
             QTreeView::item:selected {{
-                background: {ACCENT_SUBTLE_BACK};
+                background: {ACCENT_SUBTLE};
                 color: {ACCENT};
             }}
             QTreeView::branch {{
@@ -251,7 +280,7 @@ class FileTreePanel(QFrame):
         self.path_label.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_MUTED};
-                font-size: 9px;
+                font-size: 10.5px;
                 background: transparent;
                 border: none;
             }}
@@ -307,9 +336,11 @@ class EditorPanel(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ---------- 顶部工具栏 ----------
+        # ---------- 顶部工具栏(Phase UI 重排) ----------
+        # 布局:文件 | [排版组:Live/排版/字号/只读] | 弹性 | [操作组:导出/历史/预览/上一快照]
+        # 分组之间用 1px 竖线分隔,按钮高度统一 30px,字号 12px
         toolbar = QFrame()
-        toolbar.setFixedHeight(44)
+        toolbar.setFixedHeight(52)
         toolbar.setStyleSheet(f"""
             QFrame {{
                 background: #ffffff;
@@ -317,53 +348,97 @@ class EditorPanel(QFrame):
             }}
         """)
         tb = QHBoxLayout(toolbar)
-        tb.setContentsMargins(16, 0, 14, 0)
-        tb.setSpacing(10)
+        tb.setContentsMargins(18, 0, 18, 0)
+        tb.setSpacing(8)
+
+        # 竖线分隔的辅助方法
+        def _vsep():
+            line = QFrame()
+            line.setFixedSize(1, 18)
+            line.setStyleSheet(f"background: #e5e0d6; border: none;")
+            return line
+
+        # 通用按钮样式:高度 30,字号 12
+        _TB_BTN_QSS = f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: 1px solid transparent;
+                border-radius: {RADIUS_XS}px;
+                padding: 4px 11px;
+                font-size: 12px;
+                font-family: {FONT_BODY};
+            }}
+            QToolButton:hover {{
+                color: {TEXT};
+                background: {SURFACE_RAISED};
+                border: 1px solid {BORDER};
+            }}
+            QToolButton:checked {{
+                color: #fff;
+                background: {BORDER_FOCUS};
+                border: 1px solid {BORDER_FOCUS};
+            }}
+        """
+        _TB_BTN_SUCCESS_QSS = _TB_BTN_QSS.replace(
+            "QToolButton:checked {",
+            f"QToolButton:checked {{ color: #fff; background: {SUCCESS}; border: 1px solid {SUCCESS};"
+        )
 
         # 文件名(可点击重命名)
-        self.file_label = QLabel("未命名文档")
+        self.file_label = QLabel("📝 未命名文档")
         self.file_label.setStyleSheet(f"""
             QLabel {{
                 color: #1f2937;
                 font-family: {FONT_HEADING};
-                font-size: 13px;
+                font-size: 14px;
                 font-weight: 700;
                 background: transparent;
+                padding-right: 4px;
             }}
         """)
         tb.addWidget(self.file_label)
 
+        tb.addWidget(_vsep())
+
+        # === 排版组 ===
         # Live 切换
         self.live_toggle = QToolButton()
-        self.live_toggle.setText("Live")
+        self.live_toggle.setText("● Live")
         self.live_toggle.setCheckable(True)
         self.live_toggle.setChecked(True)
         self.live_toggle.setCursor(Qt.PointingHandCursor)
-        self.live_toggle.setStyleSheet(f"""
-            QToolButton {{
-                background: transparent;
-                color: {TEXT_SECONDARY};
-                border: 1px solid #d4cfc0;
-                border-radius: {RADIUS_XS}px;
-                padding: 3px 9px;
-                font-size: 11px;
-            }}
-            QToolButton:checked {{
-                color: #fff;
-                background: {SUCCESS};
-                border: 1px solid {SUCCESS};
-            }}
-        """)
+        self.live_toggle.setFixedHeight(30)
+        self.live_toggle.setStyleSheet(_TB_BTN_SUCCESS_QSS)
         self.live_toggle.toggled.connect(self._on_live_toggled)
         tb.addWidget(self.live_toggle)
 
         # 排版预设下拉(Phase 3a)
         self.preset_btn = QToolButton()
-        self.preset_btn.setText("排版")
+        self.preset_btn.setText("排版 ▾")
         self.preset_btn.setCursor(Qt.PointingHandCursor)
-        self.preset_btn.setStyleSheet(_TOOLBTN_QSS)
+        self.preset_btn.setFixedHeight(30)
+        self.preset_btn.setStyleSheet(_TB_BTN_QSS)
         self.preset_btn.setPopupMode(QToolButton.InstantPopup)
         preset_menu = QMenu(self.preset_btn)
+        preset_menu.setStyleSheet(f"""
+            QMenu {{
+                background: #ffffff;
+                color: {TEXT};
+                border: 1px solid {BORDER};
+                border-radius: {RADIUS_SM}px;
+                padding: 4px;
+                font-size: 12px;
+            }}
+            QMenu::item {{
+                padding: 6px 18px;
+                border-radius: 4px;
+            }}
+            QMenu::item:selected {{
+                background: {ACCENT_SUBTLE};
+                color: {ACCENT};
+            }}
+        """)
         # 4 套预设 → 单选菜单项
         self._preset_actions: dict[str, QAction] = {}
         for name in TYPOGRAPHY_PRESETS:
@@ -375,74 +450,97 @@ class EditorPanel(QFrame):
         self.preset_btn.setMenu(preset_menu)
         tb.addWidget(self.preset_btn)
 
-        # 字号
+        # 字号组(用 QFrame 包裹,统一一个 pill 风格)
+        font_box = QFrame()
+        font_box.setFixedHeight(30)
+        font_box.setStyleSheet(f"""
+            QFrame {{
+                background: {SURFACE};
+                border: 1px solid #e5e0d6;
+                border-radius: {RADIUS_XS}px;
+            }}
+        """)
+        fb = QHBoxLayout(font_box)
+        fb.setContentsMargins(2, 0, 2, 0)
+        fb.setSpacing(0)
         self.font_minus = QToolButton()
         self.font_minus.setText("−")
-        self.font_minus.setFixedSize(24, 24)
-        self.font_minus.setStyleSheet(_TOOLBTN_QSS)
+        self.font_minus.setFixedSize(28, 26)
+        self.font_minus.setCursor(Qt.PointingHandCursor)
+        self.font_minus.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: none;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            QToolButton:hover {{
+                background: {SURFACE_RAISED};
+                color: {ACCENT};
+            }}
+        """)
         self.font_minus.clicked.connect(lambda: self._change_font(-1))
-        tb.addWidget(self.font_minus)
+        fb.addWidget(self.font_minus)
 
         self.font_label = QLabel("14")
+        self.font_label.setFixedWidth(28)
         self.font_label.setStyleSheet(f"""
             QLabel {{
-                color: {TEXT_SECONDARY};
-                font-size: 11px;
+                color: {TEXT};
+                font-size: 12px;
+                font-weight: 600;
                 background: transparent;
-                min-width: 20px;
             }}
         """)
         self.font_label.setAlignment(Qt.AlignCenter)
-        tb.addWidget(self.font_label)
+        fb.addWidget(self.font_label)
 
         self.font_plus = QToolButton()
         self.font_plus.setText("+")
-        self.font_plus.setFixedSize(24, 24)
-        self.font_plus.setStyleSheet(_TOOLBTN_QSS)
+        self.font_plus.setFixedSize(28, 26)
+        self.font_plus.setCursor(Qt.PointingHandCursor)
+        self.font_plus.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: none;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            QToolButton:hover {{
+                background: {SURFACE_RAISED};
+                color: {ACCENT};
+            }}
+        """)
         self.font_plus.clicked.connect(lambda: self._change_font(+1))
-        tb.addWidget(self.font_plus)
-
-        tb.addStretch(1)
+        fb.addWidget(self.font_plus)
+        tb.addWidget(font_box)
 
         # 只读切换
         self.readonly_toggle = QToolButton()
-        self.readonly_toggle.setText("只读")
+        self.readonly_toggle.setText("🔒 只读")
         self.readonly_toggle.setCheckable(True)
-        self.readonly_toggle.setStyleSheet(f"""
-            QToolButton {{
-                background: transparent;
-                color: {TEXT_SECONDARY};
-                border: 1px solid #d4cfc0;
-                border-radius: {RADIUS_XS}px;
-                padding: 3px 9px;
-                font-size: 11px;
-            }}
-            QToolButton:checked {{
-                color: #fff;
-                background: {BORDER_FOCUS};
-                border: 1px solid {BORDER_FOCUS};
-            }}
-        """)
+        self.readonly_toggle.setFixedHeight(30)
+        self.readonly_toggle.setCursor(Qt.PointingHandCursor)
+        self.readonly_toggle.setStyleSheet(_TB_BTN_QSS)
         self.readonly_toggle.toggled.connect(self._on_readonly_toggled)
         tb.addWidget(self.readonly_toggle)
 
+        # 弹性 — 把操作组推到右边
+        tb.addStretch(1)
+
+        tb.addWidget(_vsep())
+
+        # === 操作组 ===
         # 导出
         self.btn_export = QToolButton()
         self.btn_export.setText("⤓ 导出")
-        self.btn_export.setStyleSheet(f"""
-            QToolButton {{
-                background: transparent;
-                color: {TEXT_SECONDARY};
-                border: 1px solid #d4cfc0;
-                border-radius: {RADIUS_XS}px;
-                padding: 3px 9px;
-                font-size: 11px;
-            }}
-            QToolButton:hover {{
-                color: {ACCENT};
-                border: 1px solid {ACCENT};
-            }}
-        """)
+        self.btn_export.setFixedHeight(30)
+        self.btn_export.setCursor(Qt.PointingHandCursor)
+        self.btn_export.setStyleSheet(_TB_BTN_QSS)
         self.btn_export.clicked.connect(self._on_export)
         tb.addWidget(self.btn_export)
 
@@ -450,7 +548,9 @@ class EditorPanel(QFrame):
         self.btn_history = QToolButton()
         self.btn_history.setText("⏱ 历史")
         self.btn_history.setCheckable(True)
-        self.btn_history.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_history.setFixedHeight(30)
+        self.btn_history.setCursor(Qt.PointingHandCursor)
+        self.btn_history.setStyleSheet(_TB_BTN_QSS)
         self.btn_history.toggled.connect(self._on_history_toggled)
         tb.addWidget(self.btn_history)
 
@@ -458,9 +558,25 @@ class EditorPanel(QFrame):
         self.btn_preview = QToolButton()
         self.btn_preview.setText("📄 预览")
         self.btn_preview.setCheckable(True)
-        self.btn_preview.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_preview.setFixedHeight(30)
+        self.btn_preview.setCursor(Qt.PointingHandCursor)
+        self.btn_preview.setStyleSheet(_TB_BTN_QSS)
         self.btn_preview.toggled.connect(self._on_preview_toggled)
         tb.addWidget(self.btn_preview)
+
+        # 跳到上一个 checkpoint(Phase 4c)
+        self.btn_prev_cp = QToolButton()
+        self.btn_prev_cp.setText("↶ 上一快照")
+        self.btn_prev_cp.setToolTip("跳到上一个快照(Ctrl+Shift+Z)")
+        self.btn_prev_cp.setFixedHeight(30)
+        self.btn_prev_cp.setCursor(Qt.PointingHandCursor)
+        self.btn_prev_cp.setStyleSheet(_TB_BTN_QSS)
+        self.btn_prev_cp.clicked.connect(self._jump_to_previous_checkpoint)
+        tb.addWidget(self.btn_prev_cp)
+
+        # 快捷键:Ctrl+Shift+Z 跳到上一个快照
+        from PySide6.QtGui import QShortcut
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self._jump_to_previous_checkpoint)
 
         layout.addWidget(toolbar)
 
@@ -552,48 +668,57 @@ class EditorPanel(QFrame):
         self._short_debounce_ms: int = cs.value("short_debounce_ms", 800, type=int)
         self._long_debounce_ms: int = cs.value("long_debounce_ms", 2500, type=int)
 
-        # ---------- 底部状态栏 ----------
+        # ---------- 底部状态栏(Phase UI 重排:加高 + 加大字号 + 信息分组) ----------
         statusbar = QFrame()
-        statusbar.setFixedHeight(24)
+        statusbar.setFixedHeight(30)
         statusbar.setStyleSheet(f"""
             QFrame {{
-                background: #f3eee4;
+                background: #f5f0e5;
                 border-top: 1px solid #e5e0d6;
             }}
         """)
         sb = QHBoxLayout(statusbar)
-        sb.setContentsMargins(20, 0, 16, 0)
+        sb.setContentsMargins(20, 0, 18, 0)
+        sb.setSpacing(14)
 
-        self.status_label = QLabel("字数: 0")
+        # 左侧:字数
+        self.status_label = QLabel("字数  0")
         self.status_label.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_SECONDARY};
-                font-size: 10px;
+                font-size: 11px;
                 background: transparent;
+                font-family: {FONT_BODY};
             }}
         """)
         sb.addWidget(self.status_label)
 
-        self.save_label = QLabel("")
-        self.save_label.setStyleSheet(f"""
-            QLabel {{
-                color: {TEXT_MUTED};
-                font-size: 10px;
-                background: transparent;
-            }}
-        """)
+        # 弹性
+        sb.addStretch(1)
+
+        # 右侧:checkpoint + save
         # Checkpoint 状态(Phase 3b)
         self.checkpoint_label = QLabel("")
         self.checkpoint_label.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_SECONDARY};
-                font-size: 10px;
+                font-size: 11px;
                 background: transparent;
-                padding-right: 8px;
+                font-family: {FONT_BODY};
             }}
         """)
-        sb.addStretch(1)
         sb.addWidget(self.checkpoint_label)
+
+        # 保存状态(默认空,有内容时高亮)
+        self.save_label = QLabel("")
+        self.save_label.setStyleSheet(f"""
+            QLabel {{
+                color: {TEXT_SECONDARY};
+                font-size: 11px;
+                background: transparent;
+                font-family: {FONT_BODY};
+            }}
+        """)
         sb.addWidget(self.save_label)
 
         layout.addWidget(statusbar)
@@ -1251,11 +1376,16 @@ class EditorPanel(QFrame):
             )
             if dlg.exec() != DiffDialog.Accepted:
                 return  # 用户拒绝
+        # Phase 4c:把整个 AI 编辑包成一个 undo 步(单次 Ctrl+Z 即可全回滚)
         cursor = self.editor.textCursor()
-        if cursor.hasSelection():
-            cursor.insertText(new_text)
-        else:
-            self.editor.insert_text(new_text)
+        cursor.beginEditBlock()
+        try:
+            if cursor.hasSelection():
+                cursor.insertText(new_text)
+            else:
+                self.editor.insert_text(new_text)
+        finally:
+            cursor.endEditBlock()
         self._hide_inline_agent()
 
     def _stop_inline_agent(self):
@@ -1291,6 +1421,75 @@ class EditorPanel(QFrame):
         else:
             if self._checkpoint_panel:
                 self._checkpoint_panel.hide()
+
+    def _jump_to_previous_checkpoint(self):
+        """跳到上一个 checkpoint(Phase 4c 撤销栈优化)。
+
+        流程:
+        1. 拿最新一个 cp
+        2. 弹 DiffDialog(current, cp_content) 让用户看 diff
+        3. 接受 → 替换为 cp_content(整个操作包成一个 undo 步)
+        4. 同时 restore_checkpoint 会自动给当前内容做 pre-restore 备份
+        """
+        if not self._file_path:
+            QMessageBox.information(self, "提示", "请先打开一个文档")
+            return
+        try:
+            from src.core.checkpoint import (
+                last_checkpoint, load_checkpoint_content,
+                default_checkpoint_root, restore_checkpoint,
+            )
+            cp = last_checkpoint(self._file_path, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "跳到快照失败", str(e))
+            return
+        if cp is None:
+            QMessageBox.information(self, "无快照", "该文档还没有任何快照")
+            return
+        current_text = self.editor.toPlainText()
+        cp_content = load_checkpoint_content(
+            self._file_path, cp.ts, root=default_checkpoint_root())
+        if cp_content is None:
+            QMessageBox.warning(self, "快照丢失", "快照内容已被清理")
+            return
+        if current_text == cp_content:
+            QMessageBox.information(
+                self, "已是当前",
+                f"当前内容与 {cp.display_time()} 的快照一致。")
+            return
+        # 弹 DiffDialog
+        from src.ui.diff_dialog import DiffDialog
+        dlg = DiffDialog(
+            current_text, cp_content,
+            title=f"跳到 {cp.display_time()} 的快照",
+            parent=self,
+        )
+        if dlg.exec() != DiffDialog.Accepted:
+            return
+        # 用 restore_checkpoint(自动给当前内容做 pre-restore 备份)
+        try:
+            ok = restore_checkpoint(
+                self._file_path, cp.ts, root=default_checkpoint_root())
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "跳转失败", str(e))
+            return
+        if not ok:
+            QMessageBox.warning(self, "跳转失败", "找不到该快照")
+            return
+        # 重新加载到 editor(包成 undo 步)
+        text = Path(self._file_path).read_text(encoding="utf-8")
+        cursor = self.editor.textCursor()
+        cursor.select(QTextCursor.Document)
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(text)
+        finally:
+            cursor.endEditBlock()
+        self._update_word_count()
+        self._update_checkpoint_label()
+        if hasattr(self, "_checkpoint_panel") and self._checkpoint_panel:
+            self._checkpoint_panel.refresh()
+        self.save_label.setText(f"已跳到 {cp.display_time()} 的快照")
 
     def _on_preview_toggled(self, checked: bool):
         """显示 / 隐藏 Markdown 实时预览(Phase 3c)。"""
@@ -1340,7 +1539,12 @@ class EditorPanel(QFrame):
             return
         text = self.editor.toPlainText()
         n = len([c for c in text if c.strip()])
-        self.status_label.setText(f"字数: {n}")
+        # 同时给一个粗略的"阅读时间"估算(中文 ~300 字/分钟)
+        mins = max(1, round(n / 300)) if n > 0 else 0
+        if mins > 0:
+            self.status_label.setText(f"字数  {n}   ·   约 {mins} 分钟")
+        else:
+            self.status_label.setText(f"字数  {n}")
 
 
 # ============================================================
@@ -1373,8 +1577,8 @@ class AssistantPanel(QFrame):
         self._quote_expanded: bool = False  # 引用列表是否展开
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(10)
 
         # ---------- 顶部:标题 + 文件路径 ----------
         head = QHBoxLayout()
@@ -1384,7 +1588,7 @@ class AssistantPanel(QFrame):
             QLabel {{
                 color: {TEXT};
                 font-family: {FONT_HEADING};
-                font-size: 14px;
+                font-size: 15px;
                 font-weight: 700;
                 background: transparent;
             }}
@@ -1395,51 +1599,68 @@ class AssistantPanel(QFrame):
         self.btn_settings.setText("⚙")
         self.btn_settings.setToolTip("LLM 设置")
         self.btn_settings.setCursor(Qt.PointingHandCursor)
-        self.btn_settings.setFixedSize(24, 24)
-        self.btn_settings.setStyleSheet(_TOOLBTN_QSS)
+        self.btn_settings.setFixedSize(28, 28)
+        self.btn_settings.setStyleSheet(f"""
+            QToolButton {{
+                background: transparent;
+                color: {TEXT_SECONDARY};
+                border: 1px solid transparent;
+                border-radius: {RADIUS_XS}px;
+                font-size: 14px;
+            }}
+            QToolButton:hover {{
+                color: {ACCENT};
+                background: {SURFACE_RAISED};
+                border: 1px solid {BORDER};
+            }}
+        """)
         self.btn_settings.clicked.connect(self._open_settings)
         head.addWidget(self.btn_settings)
         layout.addLayout(head)
 
         # Agent 人设选择器
         agent_row = QHBoxLayout()
-        agent_row.setSpacing(4)
-        agent_lbl = QLabel("人设:")
-        agent_lbl.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 10px; background: transparent;")
+        agent_row.setSpacing(6)
+        agent_lbl = QLabel("人设")
+        agent_lbl.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent; font-weight: 600;"
+        )
         agent_row.addWidget(agent_lbl)
 
         self.cmb_agent = QComboBox()
+        self.cmb_agent.setFixedHeight(30)
         self.cmb_agent.setStyleSheet(f"""
             QComboBox {{
                 background: {SURFACE_RAISED};
                 color: {TEXT};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS_XS}px;
-                padding: 3px 8px;
-                font-size: 11px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-family: {FONT_BODY};
             }}
             QComboBox:hover {{
                 border: 1px solid {ACCENT};
             }}
             QComboBox::drop-down {{
                 border: none;
-                width: 16px;
+                width: 18px;
             }}
             QComboBox::down-arrow {{
                 image: none;
                 border-left: 4px solid transparent;
                 border-right: 4px solid transparent;
                 border-top: 5px solid {TEXT_MUTED};
-                margin-right: 4px;
+                margin-right: 6px;
             }}
             QComboBox QAbstractItemView {{
                 background: {SURFACE};
                 color: {TEXT};
                 border: 1px solid {BORDER};
-                selection-background-color: {ACCENT};
-                selection-color: #0f1724;
+                selection-background-color: {ACCENT_SUBTLE};
+                selection-color: {ACCENT};
                 padding: 4px;
-                font-size: 11px;
+                font-size: 12px;
             }}
         """)
         for p in BUILTIN_PRESETS:
@@ -1454,34 +1675,38 @@ class AssistantPanel(QFrame):
         self.doc_path = QLabel("海鲸/海鲸:海军史上最大败类.txt")
         self.doc_path.setStyleSheet(f"""
             QLabel {{
-                color: {TEXT_MUTED};
-                font-size: 10px;
+                color: {TEXT_SECONDARY};
+                font-size: 11px;
                 background: transparent;
-                border: 1px solid {BORDER};
-                border-radius: {RADIUS_XS}px;
-                padding: 3px 7px;
+                border-left: 2px solid {ACCENT};
+                border-top: none;
+                border-right: none;
+                border-bottom: none;
+                border-radius: 0px;
+                padding: 4px 8px;
             }}
         """)
         self.doc_path.setWordWrap(True)
         layout.addWidget(self.doc_path)
 
-        # ---------- 大提示区 ----------
+        # ---------- 大提示区(更精致) ----------
         self.hint_box = QFrame()
         self.hint_box.setStyleSheet(f"""
             QFrame {{
                 background: {SURFACE_RAISED};
                 border: 1px solid {BORDER};
+                border-left: 3px solid {ACCENT};
                 border-radius: {RADIUS}px;
-                padding: 10px 12px;
             }}
         """)
         hb = QVBoxLayout(self.hint_box)
+        hb.setContentsMargins(12, 10, 12, 10)
         hb.setSpacing(4)
         self.hint_icon = QLabel("✨")
         self.hint_icon.setStyleSheet(f"""
             QLabel {{
                 color: {ACCENT};
-                font-size: 14px;
+                font-size: 16px;
                 background: transparent;
             }}
         """)
@@ -1491,7 +1716,7 @@ class AssistantPanel(QFrame):
             QLabel {{
                 color: {TEXT};
                 font-family: {FONT_HEADING};
-                font-size: 12px;
+                font-size: 13px;
                 font-weight: 700;
                 background: transparent;
             }}
@@ -1503,33 +1728,49 @@ class AssistantPanel(QFrame):
         self.hint_desc.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_SECONDARY};
-                font-size: 10.5px;
+                font-size: 11.5px;
                 background: transparent;
-                line-height: 1.5;
+                line-height: 1.55;
             }}
         """)
         self.hint_desc.setWordWrap(True)
         hb.addWidget(self.hint_desc)
         layout.addWidget(self.hint_box)
 
-        # ---------- 预设动作 ----------
+        # ---------- 预设动作(2 列网格布局) ----------
         preset_label = QLabel("快捷动作")
         preset_label.setStyleSheet(f"""
             QLabel {{
                 color: {TEXT_MUTED};
-                font-size: 10px;
+                font-size: 11px;
+                font-weight: 600;
                 background: transparent;
                 padding-top: 4px;
+                letter-spacing: 0.5px;
             }}
         """)
         layout.addWidget(preset_label)
 
+        # 2 列网格:用 QGridLayout 替代 stack,7 个动作 → 4 行 2 列
         self.preset_buttons: List[QFrame] = []
-        # 7 种快捷操作(对应 PRD §5.2)
-        for action in QUICK_ACTIONS:
+        from PySide6.QtWidgets import QGridLayout
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        for i, action in enumerate(QUICK_ACTIONS):
             btn = self._make_quick_action_btn(action)
-            layout.addWidget(btn)
+            r, c = divmod(i, 2)
+            grid.addWidget(btn, r, c)
             self.preset_buttons.append(btn)
+        # 偶数列 stretch,让网格列等宽
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        # 把 grid 套进一个容器(让 QGridLayout 接受 1 列空 cell 时不撑开)
+        grid_host = QFrame()
+        grid_host.setStyleSheet("background: transparent; border: none;")
+        grid_host.setLayout(grid)
+        layout.addWidget(grid_host)
 
         # ---------- 引用选区列表(条件显示) ----------
         self.quote_box = QFrame()
@@ -1562,28 +1803,30 @@ class AssistantPanel(QFrame):
                 color: {TEXT};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS}px;
-                padding: 8px 10px;
-                font-size: 12px;
-                line-height: 1.6;
+                padding: 10px 12px;
+                font-size: 12.5px;
+                line-height: 1.65;
+                font-family: {FONT_BODY};
                 selection-background-color: {ACCENT};
             }}
         """)
-        self.response.setMinimumHeight(120)
-        self.response.setPlaceholderText("(响应会显示在这里)")
+        self.response.setMinimumHeight(140)
+        self.response.setPlaceholderText("✨ AI 响应会显示在这里")
         layout.addWidget(self.response, 1)
 
-        # ---------- 输入框 ----------
+        # ---------- 输入框(更紧凑) ----------
         self.input = QTextEdit()
-        self.input.setPlaceholderText("向智能体提问…")
-        self.input.setFixedHeight(64)
+        self.input.setPlaceholderText("向智能体提问…(Ctrl+Enter 发送)")
+        self.input.setFixedHeight(58)
         self.input.setStyleSheet(f"""
             QTextEdit {{
                 background: {BG};
                 color: {TEXT};
                 border: 1px solid {BORDER};
                 border-radius: {RADIUS}px;
-                padding: 6px 8px;
-                font-size: 12px;
+                padding: 7px 10px;
+                font-size: 12.5px;
+                font-family: {FONT_BODY};
             }}
             QTextEdit:focus {{
                 border: 1px solid {ACCENT};
@@ -1591,20 +1834,22 @@ class AssistantPanel(QFrame):
         """)
         layout.addWidget(self.input)
 
-        # ---------- 发送 / 引用 / 插入 ----------
+        # ---------- 发送 / 引用 / 插入(更紧凑、统一样式) ----------
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
 
-        self.btn_quote = QPushButton("📎 引用选区")
+        self.btn_quote = QPushButton("📎 引用")
         self.btn_quote.setCursor(Qt.PointingHandCursor)
+        self.btn_quote.setFixedHeight(30)
         self.btn_quote.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
-                border-radius: {RADIUS_SM}px;
-                padding: 4px 9px;
-                font-size: 11px;
+                border-radius: {RADIUS_XS}px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-family: {FONT_BODY};
             }}
             QPushButton:hover {{
                 color: {ACCENT};
@@ -1614,17 +1859,19 @@ class AssistantPanel(QFrame):
         self.btn_quote.clicked.connect(self._on_quote)
         action_row.addWidget(self.btn_quote)
 
-        self.btn_insert = QPushButton("↳ 应用替换")
+        self.btn_insert = QPushButton("↳ 替换")
         self.btn_insert.setCursor(Qt.PointingHandCursor)
         self.btn_insert.setToolTip("用 AI 响应替换编辑器中的原选区")
+        self.btn_insert.setFixedHeight(30)
         self.btn_insert.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
-                border-radius: {RADIUS_SM}px;
-                padding: 4px 9px;
-                font-size: 11px;
+                border-radius: {RADIUS_XS}px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-family: {FONT_BODY};
             }}
             QPushButton:hover {{
                 color: {ACCENT};
@@ -1632,6 +1879,7 @@ class AssistantPanel(QFrame):
             }}
             QPushButton:disabled {{
                 color: {TEXT_MUTED};
+                border: 1px solid {BORDER};
             }}
         """)
         self.btn_insert.setEnabled(False)
@@ -1642,15 +1890,17 @@ class AssistantPanel(QFrame):
 
         self.btn_send = QPushButton("发送  ⏎")
         self.btn_send.setCursor(Qt.PointingHandCursor)
+        self.btn_send.setFixedHeight(30)
         self.btn_send.setStyleSheet(f"""
             QPushButton {{
                 background: {ACCENT};
                 color: #0f1724;
                 border: none;
-                border-radius: {RADIUS_SM}px;
-                padding: 4px 14px;
-                font-size: 11px;
+                border-radius: {RADIUS_XS}px;
+                padding: 4px 16px;
+                font-size: 12px;
                 font-weight: 700;
+                font-family: {FONT_BODY};
             }}
             QPushButton:hover {{
                 background: {ACCENT_HOVER};
@@ -1679,11 +1929,11 @@ class AssistantPanel(QFrame):
 
     # ---------- 快捷操作按钮 ----------
     def _make_quick_action_btn(self, action: QuickAction):
-        """快捷操作按钮(QFrame 替代 QPushButton,正确处理内部 layout)。"""
+        """快捷操作按钮(2 列网格中的卡片,更紧凑)。"""
         btn = QFrame()
         btn.setObjectName(f"QuickAction_{action.id}")
         btn.setCursor(Qt.PointingHandCursor)
-        btn.setFixedHeight(42)
+        btn.setMinimumHeight(46)
         btn.setStyleSheet(f"""
             QFrame#QuickAction_{action.id} {{
                 background: {SURFACE_RAISED};
@@ -1696,26 +1946,41 @@ class AssistantPanel(QFrame):
             }}
         """)
 
-        # 横向布局:左标签,右模式徽标
-        h = QHBoxLayout(btn)
-        h.setContentsMargins(10, 4, 8, 4)
-        h.setSpacing(6)
+        # 垂直布局:标题 + 描述(更紧凑、信息更密)
+        v = QVBoxLayout(btn)
+        v.setContentsMargins(10, 6, 8, 6)
+        v.setSpacing(1)
 
-        t = QLabel(f"{action.label}  ·  {action.desc}")
+        # 标题行:左动作名,右模式徽标
+        title_row = QHBoxLayout()
+        title_row.setSpacing(4)
+        title_row.setContentsMargins(0, 0, 0, 0)
+        t = QLabel(action.label)
         t.setStyleSheet(
-            f"color: {TEXT}; font-size: 11px;"
+            f"color: {TEXT}; font-size: 12px; font-weight: 700;"
             f" background: transparent; border: none;"
         )
-        h.addWidget(t, 1)
+        title_row.addWidget(t)
+        title_row.addStretch(1)
 
-        # 模式徽标(chat/edit)
+        # 模式徽标(chat/edit)— 弱化
         mode_badge = QLabel(action.mode)
         mode_badge.setStyleSheet(
             f"color: {TEXT_MUTED}; font-size: 9px; font-weight: 600;"
             f" background: transparent; border: 1px solid {BORDER};"
             f" border-radius: 3px; padding: 1px 4px;"
         )
-        h.addWidget(mode_badge)
+        title_row.addWidget(mode_badge)
+        v.addLayout(title_row)
+
+        # 描述(更小、更淡)
+        d = QLabel(action.desc)
+        d.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10.5px;"
+            f" background: transparent; border: none;"
+        )
+        d.setWordWrap(True)
+        v.addWidget(d)
 
         # 处理 click
         def _click(ev, a=action):
@@ -2453,7 +2718,7 @@ class WriteView(QWidget):
         self.file_tree = FileTreePanel(self._workspace)
         splitter.addWidget(self.file_tree)
 
-        # 中:QTabWidget(Phase 4b 多 Tab)
+        # 中:QTabWidget(Phase 4b 多 Tab + Phase UI 重排)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setTabsClosable(True)
@@ -2463,30 +2728,35 @@ class WriteView(QWidget):
                 border: none;
                 background: #fbfaf7;
             }}
+            QTabBar {{
+                background: transparent;
+                qproperty-drawBase: 0;
+            }}
             QTabBar::tab {{
-                background: #f3eee4;
+                background: transparent;
                 color: {TEXT_SECONDARY};
-                padding: 6px 14px;
-                margin-right: 2px;
-                border: 1px solid {BORDER};
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                font-size: 11px;
+                padding: 9px 18px;
+                margin-right: 1px;
+                border: none;
+                border-bottom: 2px solid transparent;
+                font-size: 12.5px;
+                font-family: {FONT_BODY};
                 min-width: 80px;
                 max-width: 200px;
             }}
-            QTabBar::tab:selected {{
-                background: #fbfaf7;
-                color: {TEXT};
-                font-weight: 600;
-            }}
             QTabBar::tab:hover {{
-                background: #fefdfa;
+                color: {TEXT};
+                background: rgba(200, 148, 110, 0.04);
+            }}
+            QTabBar::tab:selected {{
+                color: {ACCENT};
+                border-bottom: 2px solid {ACCENT};
+                font-weight: 600;
             }}
             QTabBar::close-button {{
                 image: none;
                 subcontrol-position: right;
+                margin: 2px;
             }}
         """)
         # 信号
@@ -2505,7 +2775,8 @@ class WriteView(QWidget):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([200, 800, 320])
+        # 默认比例:文件树 220 / 编辑器弹性 / 助手 340
+        splitter.setSizes([220, 700, 340])
 
         root.addWidget(splitter)
 
