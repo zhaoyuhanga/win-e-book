@@ -185,11 +185,18 @@ class WriteViewTabCloseTest(unittest.TestCase):
         QSettings("WinEBook", WriteView._TABS_KEY).clear()
         self.tmp = _create_workspace()
         self._orig_ws = _patch_workspace(self.tmp)
+        # patch QMessageBox.question 免得 _on_close_tab 在测试里卡住
+        from PySide6.QtWidgets import QMessageBox
+        self._orig_question = QMessageBox.question
+        QMessageBox.question = staticmethod(
+            lambda *a, **k: QMessageBox.Yes)
         self.view = WriteView()
         self.view._add_new_tab(str(self.tmp / "doc1.md"))
         self.view._add_new_tab(str(self.tmp / "doc2.md"))
 
     def tearDown(self):
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.question = self._orig_question
         _restore_workspace(self._orig_ws)
         try:
             self.view.deleteLater()

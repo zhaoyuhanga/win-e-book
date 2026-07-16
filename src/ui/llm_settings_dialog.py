@@ -126,6 +126,59 @@ class LLMSettingsDialog(QDialog):
         test_row.addWidget(self.lbl_test, 1)
         root.addLayout(test_row)
 
+        # 开发者选项区(打开日志 / 清空日志)
+        from src.core import dev_log
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(8)
+        dev_lbl = QLabel("开发者")
+        dev_lbl.setStyleSheet(
+            "color: #6b7280; font-size: 12px; font-weight: 700;")
+        dev_row.addWidget(dev_lbl)
+
+        self.btn_log = QPushButton("📄 打开日志")
+        self.btn_log.setCursor(Qt.PointingHandCursor)
+        self.btn_log.setStyleSheet("""
+            QPushButton {
+                background: transparent; color: #374151;
+                border: 1px solid #d1d5db; border-radius: 5px;
+                padding: 4px 10px; font-size: 12px;
+            }
+            QPushButton:hover { color: #c8946e; border-color: #c8946e; }
+        """)
+        self.btn_log.clicked.connect(self._open_log)
+        dev_row.addWidget(self.btn_log)
+
+        self.btn_log_dir = QPushButton("📁 日志目录")
+        self.btn_log_dir.setCursor(Qt.PointingHandCursor)
+        self.btn_log_dir.setStyleSheet(self.btn_log.styleSheet())
+        self.btn_log_dir.clicked.connect(self._open_log_dir)
+        dev_row.addWidget(self.btn_log_dir)
+
+        self.btn_log_clear = QPushButton("🗑 清空")
+        self.btn_log_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_log_clear.setStyleSheet(self.btn_log.styleSheet())
+        self.btn_log_clear.clicked.connect(self._clear_log)
+        dev_row.addWidget(self.btn_log_clear)
+        dev_row.addStretch(1)
+        root.addLayout(dev_row)
+
+        # 实时日志预览(最近 5 行,只读)
+        self.lbl_log_tail = QLabel("(暂无日志)")
+        self.lbl_log_tail.setStyleSheet("""
+            QLabel {
+                color: #6b7280; font-size: 11px;
+                background: #f9fafb; border: 1px solid #e5e7eb;
+                border-radius: 5px; padding: 6px 8px;
+                font-family: 'Consolas', 'Cascadia Code', monospace;
+            }
+        """)
+        self.lbl_log_tail.setWordWrap(True)
+        self.lbl_log_tail.setMaximumHeight(70)
+        self.lbl_log_tail.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.lbl_log_tail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self.lbl_log_tail)
+        self._refresh_log_tail()
+
         root.addStretch(1)
 
         # 按钮
@@ -198,3 +251,46 @@ class LLMSettingsDialog(QDialog):
 
     def get_config(self) -> LLMConfig:
         return self._result_cfg
+
+    # ---------- 开发者选项 ----------
+    def _open_log(self):
+        from src.core import dev_log
+        import subprocess
+        p = dev_log.log_path()
+        if not p.exists():
+            QMessageBox.information(self, "日志", "暂无日志文件")
+            return
+        # Windows:用 notepad 打开
+        try:
+            subprocess.Popen(["notepad.exe", str(p)])
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "打开失败", f"{e}\n\n路径:{p}")
+
+    def _open_log_dir(self):
+        from src.core import dev_log
+        import subprocess
+        p = dev_log.log_path().parent
+        try:
+            # Windows 资源管理器打开
+            subprocess.Popen(f'explorer "{p}"')
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "打开失败", f"{e}\n\n路径:{p}")
+
+    def _clear_log(self):
+        from src.core import dev_log
+        ret = QMessageBox.question(
+            self, "清空日志", "确认清空开发者日志?",
+            QMessageBox.Yes | QMessageBox.No)
+        if ret == QMessageBox.Yes:
+            dev_log.clear()
+            self._refresh_log_tail()
+
+    def _refresh_log_tail(self):
+        from src.core import dev_log
+        text = dev_log.tail(5).strip() or "(暂无日志)"
+        # 截断过长行
+        lines = text.split("\n")
+        for i, ln in enumerate(lines):
+            if len(ln) > 200:
+                lines[i] = ln[:200] + "…"
+        self.lbl_log_tail.setText("\n".join(lines))

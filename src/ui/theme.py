@@ -39,6 +39,27 @@ READ_SUBTITLE   = "#8a7b65"
 
 
 # ============================================================
+# 墨写专用浅色主题(参考 v2 设计图)
+# 与主框架深色区分,白底 + 浅灰 + 暖橙主色,适合长时间写作
+# ============================================================
+WRITE_BG        = "#f6f5f1"   # 主背景(暖白)
+WRITE_PANEL     = "#ffffff"   # 面板/卡片白
+WRITE_PANEL_ALT = "#faf8f2"   # 次级卡片(暖白)
+WRITE_SURFACE   = "#eeebe2"   # 输入框/按钮 idle 背景
+WRITE_BORDER    = "#e3ddcd"   # 边框(米色)
+WRITE_BORDER_SOFT = "#ebe5d5" # 软边框
+WRITE_TEXT      = "#2a2520"   # 主文字(深棕黑)
+WRITE_TEXT_2    = "#6b6358"   # 次文字
+WRITE_TEXT_3    = "#9a9285"   # 辅文字
+WRITE_ACCENT    = "#c8946e"   # 主色(暖橙,与全站 ACCENT 同源)
+WRITE_ACCENT_H  = "#b07f5a"   # 主色 hover
+WRITE_ACCENT_S  = "rgba(200, 148, 110, 0.10)"  # 主色 10% 背景
+WRITE_DANGER    = "#d65a5a"
+WRITE_SUCCESS   = "#5fa37a"
+WRITE_SHADOW    = "rgba(80, 60, 30, 0.06)"  # 阴影色(用于 box-shadow 感)
+
+
+# ============================================================
 # 全局 QSS
 # ============================================================
 THEME_QSS = f"""
