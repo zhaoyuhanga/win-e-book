@@ -2017,16 +2017,26 @@ class AssistantPanel(QFrame):
         """)
         v.addWidget(self.input)
 
-        # 引用 / 替换 / 发送
+        # 引用 / 插入到文件 / 替换选区 / 发送
         action_row = QHBoxLayout()
         action_row.setSpacing(6)
-        self.btn_quote = QPushButton("📎 引用选区")
+        self.btn_quote = QPushButton("📎 引用")
         self.btn_quote.setCursor(Qt.PointingHandCursor)
         self.btn_quote.setFixedHeight(32)
         self.btn_quote.setStyleSheet(_WRITE_TOOL_BTN_QSS)
         self.btn_quote.clicked.connect(self._on_quote)
         action_row.addWidget(self.btn_quote)
-        self.btn_insert = QPushButton("↳ 替换选区")
+        # 新增:插入到文件(最常用:把 AI 大纲/建议写到当前文档末尾)
+        self.btn_append = QPushButton("📥 插入到文件")
+        self.btn_append.setCursor(Qt.PointingHandCursor)
+        self.btn_append.setToolTip("把 AI 响应追加到当前文档末尾")
+        self.btn_append.setFixedHeight(32)
+        self.btn_append.setStyleSheet(_WRITE_TOOL_BTN_QSS)
+        self.btn_append.setEnabled(False)
+        self.btn_append.clicked.connect(self._on_append_to_file)
+        action_row.addWidget(self.btn_append)
+        # 替换选区(原有)
+        self.btn_insert = QPushButton("↳ 替换")
         self.btn_insert.setCursor(Qt.PointingHandCursor)
         self.btn_insert.setToolTip("用 AI 响应替换编辑器中的原选区")
         self.btn_insert.setFixedHeight(32)
@@ -2314,7 +2324,7 @@ class AssistantPanel(QFrame):
 
     def _on_insert(self):
         """edit 模式:用 AI 输出替换编辑器选区;chat 模式:插入到光标。"""
-        text = self.response.toPlainText().strip()
+        text = self._get_response_text()
         if not text:
             return
         if getattr(self, "_edit_action_mode", False):
@@ -2328,115 +2338,212 @@ class AssistantPanel(QFrame):
             # 插入到光标
             self.editor.insert_text("\n\n" + text + "\n\n")
         self.btn_insert.setEnabled(False)
+        self.btn_append.setEnabled(False)
+
+    def _on_append_to_file(self):
+        """把 AI 响应追加到当前文档末尾(写大纲最常用)。"""
+        from src.core import dev_log
+        text = self._get_response_text()
+        if not text:
+            return
+        ed = self.editor
+        if not ed._file_path:
+            # 没文件 → 弹保存对话框
+            path, _ = QFileDialog.getSaveFileName(
+                self, "保存为",
+                "新文件.txt",
+                "Text Files (*.txt);;Markdown (*.md)")
+            if not path:
+                return
+            ed._file_path = path
+            ed.file_label.setText(Path(path).name)
+        # 追加到文件末尾
+        existing = ""
+        try:
+            existing = Path(ed._file_path).read_text(encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        # 加个标题分隔,方便识别
+        ts = time.strftime("%Y-%m-%d %H:%M")
+        sep = f"\n\n---\n\n## AI 建议 · {ts}\n\n"
+        new_content = existing.rstrip() + sep + text.strip() + "\n"
+        try:
+            Path(ed._file_path).write_text(new_content, encoding="utf-8")
+            # 同步到 editor
+            ed.editor.blockSignals(True)
+            ed.editor.setPlainText(new_content)
+            ed.editor.blockSignals(False)
+            ed._update_word_count()
+            dev_log.info(
+                f"_on_append_to_file: 已追加 {len(text)} 字到 {Path(ed._file_path).name}")
+            # 状态提示
+            if hasattr(ed, "save_label"):
+                ed.save_label.setText(f"✅ 已写入 {Path(ed._file_path).name}")
+        except Exception as e:  # noqa: BLE001
+            dev_log.error(f"_on_append_to_file: 写入失败 - {e}", e)
+            QMessageBox.warning(self, "写入失败", str(e))
+            return
+        # 禁用按钮(已应用)
+        self.btn_insert.setEnabled(False)
+        self.btn_append.setEnabled(False)
+
+    def _get_response_text(self) -> str:
+        """拿到响应区文本(去掉「⏳ 正在生成…」占位)。"""
+        text = self.response.toPlainText()
+        if text.startswith("⏳ 正在生成…"):
+            text = text[len("⏳ 正在生成…"):]
+        return text.strip()
 
     def _on_send(self):
         from src.core import dev_log
-        question = self.input.toPlainText().strip()
-        if not question:
-            dev_log.info("_on_send: 跳过(空输入)")
-            return
-        dev_log.info(f"_on_send: 收到问题({len(question)} 字),开始检查 LLM")
-        if not self._llm_cfg.is_valid():
-            dev_log.warn(
-                f"_on_send: LLM 未配置(provider={self._llm_cfg.provider!r}, "
-                f"key_len={len(self._llm_cfg.api_key)}, "
-                f"base={self._llm_cfg.base_url!r}, model={self._llm_cfg.model!r})")
-            QMessageBox.warning(
-                self, "未配置 LLM",
-                "请先在右上角「⚙」配置 API key / base_url / model。")
-            return
-        # 自定义提问 → 用当前人设作为 system
-        ctx = self.editor.toPlainText()
-        if len(ctx) > 8000:
-            ctx = ctx[:8000] + "…(已截断)"
-        user_msg = f"{question}\n\n---\n(以下为当前文档内容供参考,可能很长)\n\n{ctx}"
-        if self._quotes:
-            quote_text = "\n\n".join(
-                f"> {q[:300]}{'…' if len(q) > 300 else ''}"
-                for q in self._quotes
-            )
-            user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
-        agent_system = build_agent_system(self._active_agent)
-        messages = [
-            {"role": "system", "content": agent_system},
-            {"role": "user", "content": user_msg},
-        ]
-        self._current_preset = "问答"
-        self._edit_action_mode = False
-        # 给点可见反馈
-        self._set_busy(True)
-        self.response.setPlainText("⏳ 正在生成…")
-        dev_log.info(
-            f"_on_send: 模型={self._llm_cfg.model} provider={self._llm_cfg.provider} "
-            f"base={self._llm_cfg.base_url},开始流式请求")
         try:
+            question = self.input.toPlainText().strip()
+            if not question:
+                dev_log.info("_on_send: 跳过(空输入)")
+                return
+            dev_log.info(f"_on_send: 收到问题({len(question)} 字),开始检查 LLM")
+
+            # 0. 切到助手 tab,让用户看得到响应
+            if hasattr(self, "tabs") and self.tabs is not None:
+                self.tabs.setCurrentIndex(0)
+
+            if not self._llm_cfg.is_valid():
+                dev_log.warn(
+                    f"_on_send: LLM 未配置(provider={self._llm_cfg.provider!r}, "
+                    f"key_len={len(self._llm_cfg.api_key)}, "
+                    f"base={self._llm_cfg.base_url!r}, model={self._llm_cfg.model!r})")
+                QMessageBox.warning(
+                    self, "未配置 LLM",
+                    "请先在右上角「⚙」配置 API key / base_url / model。")
+                return
+
+            # 1. 拿上下文(超大文件 → 截断 + 提示)
+            dev_log.info("_on_send: 读 editor 上下文…")
+            full_ctx = self.editor.toPlainText()
+            ctx_len = len(full_ctx)
+            if ctx_len > 8000:
+                ctx = full_ctx[:8000] + "…(已截断)"
+                dev_log.info(f"_on_send: 上下文 {ctx_len} 字 → 截断 8000")
+            else:
+                ctx = full_ctx
+            user_msg = f"{question}\n\n---\n(以下为当前文档内容供参考,{'已截断' if ctx_len > 8000 else '完整'})\n\n{ctx}"
+            if self._quotes:
+                quote_text = "\n\n".join(
+                    f"> {q[:300]}{'…' if len(q) > 300 else ''}"
+                    for q in self._quotes
+                )
+                user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
+
+            # 2. 构造消息
+            agent_system = build_agent_system(self._active_agent)
+            messages = [
+                {"role": "system", "content": agent_system},
+                {"role": "user", "content": user_msg},
+            ]
+            self._current_preset = "问答"
+            self._edit_action_mode = False
+
+            # 3. 可见反馈
+            self._set_busy(True)
+            self.response.setPlainText("⏳ 正在生成…")
+            self._last_response_text = ""  # 清缓存,方便后续「插入到文件」
+            dev_log.info(
+                f"_on_send: 模型={self._llm_cfg.model} provider={self._llm_cfg.provider} "
+                f"base={self._llm_cfg.base_url},开始流式请求")
+
+            # 4. 启动流
             self._start_stream(messages)
         except Exception as e:  # noqa: BLE001
-            dev_log.error("_on_send: _start_stream 抛异常", e)
-            self._set_busy(False)
-            self.response.setPlainText(f"[启动失败] {e}")
+            from src.core import dev_log
+            dev_log.error(f"_on_send: 整体异常 - {e}", e)
+            try:
+                self._set_busy(False)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.response.setPlainText(f"❌ 启动失败:{e}\n\n(完整错误已写入 dev.log)")
+            except Exception:  # noqa: BLE001
+                pass
             QMessageBox.warning(self, "发送失败", str(e))
 
     def _run_quick_action(self, action: QuickAction):
         """执行快捷操作。"""
-        if self._thread is not None and self._thread.isRunning():
-            return
-        if not self._llm_cfg.is_valid():
-            QMessageBox.warning(
-                self, "未配置 LLM",
-                "请先在右上角「⚙」配置 API key / base_url / model。")
-            return
-        sel = self.editor.selected_text()
-        if action.mode == "edit" and not sel:
-            QMessageBox.information(
-                self, "无选中文本",
-                f"「{action.label}」需要先在编辑器里选中要操作的文本。")
-            return
+        from src.core import dev_log
+        try:
+            if self._thread is not None and self._thread.isRunning():
+                dev_log.info(f"_run_quick_action: 线程在跑,跳过 {action.id}")
+                return
+            if not self._llm_cfg.is_valid():
+                QMessageBox.warning(
+                    self, "未配置 LLM",
+                    "请先在右上角「⚙」配置 API key / base_url / model。")
+                return
+            sel = self.editor.selected_text()
+            if action.mode == "edit" and not sel:
+                QMessageBox.information(
+                    self, "无选中文本",
+                    f"「{action.label}」需要先在编辑器里选中要操作的文本。")
+                return
 
-        self._current_preset = action.id
-        # 构造 system prompt:人设 + 快捷操作 prompt
-        agent_system = build_agent_system(self._active_agent)
-        if action.mode == "edit":
-            # edit 模式:对选区做改写,要求模型只输出结果
-            user_msg = f"{action.prompt}\n\n---\n选中文本:\n{sel}"
-        else:
-            # chat 模式:解释/批评,基于选区或全文
-            if sel:
-                user_msg = f"{action.prompt}\n\n---\n选中内容:\n{sel}"
+            # 切到助手 tab,响应可见
+            if hasattr(self, "tabs") and self.tabs is not None:
+                self.tabs.setCurrentIndex(0)
+
+            self._current_preset = action.id
+            self._set_busy(True)
+            self.response.setPlainText("⏳ 正在生成…")
+            # 构造 system prompt:人设 + 快捷操作 prompt
+            agent_system = build_agent_system(self._active_agent)
+            if action.mode == "edit":
+                user_msg = f"{action.prompt}\n\n---\n选中文本:\n{sel}"
             else:
-                ctx = self.editor.toPlainText()
-                if len(ctx) > 12000:
-                    ctx = ctx[:12000] + "…(已截断)"
-                user_msg = f"{action.prompt}\n\n---\n当前文档:\n{ctx}"
-        # 加引用选区(如果有)
-        if self._quotes:
-            quote_text = "\n\n".join(
-                f"> {q[:300]}{'…' if len(q) > 300 else ''}"
-                for q in self._quotes
-            )
-            user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
-        # BM25 工作区上下文(chat 模式 + 文档大时)
-        if action.mode == "chat":
+                if sel:
+                    user_msg = f"{action.prompt}\n\n---\n选中内容:\n{sel}"
+                else:
+                    ctx = self.editor.toPlainText()
+                    if len(ctx) > 12000:
+                        ctx = ctx[:12000] + "…(已截断)"
+                    user_msg = f"{action.prompt}\n\n---\n当前文档:\n{ctx}"
+            if self._quotes:
+                quote_text = "\n\n".join(
+                    f"> {q[:300]}{'…' if len(q) > 300 else ''}"
+                    for q in self._quotes
+                )
+                user_msg = f"{user_msg}\n\n---\n用户引用的选区:\n{quote_text}"
+            # BM25 工作区上下文(chat 模式 + 文档大时)
+            if action.mode == "chat":
+                try:
+                    from src.core.bm25 import search_workspace, format_hits_for_prompt
+                    from src.core.write_agent import default_workspace_root
+                    ws_root = default_workspace_root()
+                    query = sel[:200] if sel else self.editor.toPlainText()[:200]
+                    hits = search_workspace(ws_root, query, k=3, snippet_chars=520)
+                    ctx = format_hits_for_prompt(hits, max_total_chars=1500)
+                    if ctx:
+                        user_msg = f"{user_msg}\n\n---\n[工作区相关片段,供参考]\n{ctx}"
+                except Exception:  # noqa: BLE001
+                    pass
+            messages = [
+                {"role": "system", "content": agent_system},
+                {"role": "user", "content": user_msg},
+            ]
+            self._edit_action_mode = (action.mode == "edit")
+            self._edit_action_original = sel
+            self._start_stream(messages)
+        except Exception as e:  # noqa: BLE001
+            from src.core import dev_log
+            dev_log.error(f"_run_quick_action: 异常 - {e}", e)
             try:
-                from src.core.bm25 import search_workspace, format_hits_for_prompt
-                from src.core.write_agent import default_workspace_root
-                ws_root = default_workspace_root()
-                query = sel[:200] if sel else self.editor.toPlainText()[:200]
-                hits = search_workspace(ws_root, query, k=3, snippet_chars=520)
-                ctx = format_hits_for_prompt(hits, max_total_chars=1500)
-                if ctx:
-                    user_msg = f"{user_msg}\n\n---\n[工作区相关片段,供参考]\n{ctx}"
+                self._set_busy(False)
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                self.response.setPlainText(f"❌ 启动失败:{e}")
+            except Exception:  # noqa: BLE001
+                pass
+            QMessageBox.warning(self, "快捷动作失败", str(e))
 
-        messages = [
-            {"role": "system", "content": agent_system},
-            {"role": "user", "content": user_msg},
-        ]
-        # edit 模式 → 流式完后提供"应用替换"按钮
-        self._edit_action_mode = (action.mode == "edit")
-        self._edit_action_original = sel
-        self._start_stream(messages)
+    # ---------- 流式 ----------
 
     # ---------- 流式 ----------
     def _start_stream(self, messages: list):
@@ -2488,7 +2595,11 @@ class AssistantPanel(QFrame):
         from src.core import dev_log
         dev_log.info(f"_on_finished: 完成,共 {len(full)} 字")
         self._set_busy(False)
-        self.btn_insert.setEnabled(bool(full.strip()))
+        has_text = bool(full.strip())
+        self.btn_insert.setEnabled(has_text)
+        self.btn_append.setEnabled(has_text)
+        if has_text:
+            dev_log.info("_on_finished: 「插入到文件」按钮已启用")
 
     def _on_failed(self, err: str):
         from src.core import dev_log
@@ -2502,6 +2613,10 @@ class AssistantPanel(QFrame):
     def _set_busy(self, busy: bool):
         self.btn_send.setEnabled(not busy)
         self.btn_send.setText("⏳ 生成中…" if busy else "发送  ⏎")
+        # 忙时禁用「插入到文件」「替换」,免得点了半成品写进去
+        if busy:
+            self.btn_insert.setEnabled(False)
+            self.btn_append.setEnabled(False)
         for b in self.preset_buttons:
             # QFrame 没有 setEnabled,改用 setProperty + 改 cursor
             b.setProperty("busy", busy)
